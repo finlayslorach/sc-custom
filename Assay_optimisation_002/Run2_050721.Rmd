@@ -1,0 +1,354 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(dplyr) 
+library(stringr) 
+library(ggplot2) 
+library(knitr)
+library(scater)
+library(scran)
+library(Seurat)
+library(tidyr)
+
+theme_set(theme_bw()) 
+
+```
+
+
+```{r Read Data}
+
+cell_metrics <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run2_160621/QIAseqUltraplexRNA_173745/primary_analysis/Metrics_by_cell.csv')
+sce_mat <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run2_160621/QIAseqUltraplexRNA_173745/primary_analysis/UMI_Gene_matrix.csv')
+UPX_ids <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run2_160621/UPX Cell ID sequences_96.csv')
+
+```
+
+```{r Getting quality control metrics}
+## plot beta actin and gapdh for eaech sample type 
+f.mat <- sce_mat %>% dplyr::filter(gene=='ACTB'|gene=='GAPDH') %>% dplyr::select(-c(gene.id, strand,chrom,loc.5.,loc.3.)) 
+f.mat %>% dplyr::select(contains('multi'))
+f.mat <- melt(f.mat, variable.name = 'sample', value.name = 'counts')
+f.mat$sample <- stringr::word(f.mat$sample, 4, sep='_')
+f.mat$sample[is.na(f.mat$sample)] <- 'tip'
+## plotting 
+ggplot(f.mat) + geom_boxplot(aes(x=sample, y=log(counts+1))) + facet_wrap(~gene) 
+f.mat$sample
+```
+
+
+```{r reads aligned vs umis}
+
+## Do boxplot of reads aligned
+cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  dplyr::select(reads.used..aligned.to.genome, sample) %>%
+  dplyr::rename('Reads aligned to human GRCh38 reference genome'=reads.used..aligned.to.genome) %>%
+  tidyr::pivot_longer(., -c(sample), names_to='sample_type', values_to='value') %>% 
+  ggplot(.) +
+  geom_boxplot(mapping=aes(x=factor(sample), y=value, colour=sample)) +
+  facet_grid(~sample_type) +
+  labs(x='Sample type', y='Aligned reads') +
+  scale_y_log10()+
+  scale_y_continuous(labels = scales::comma, breaks=c(0,200000,400000,600000,800000)) +
+  scale_x_discrete(labels=c(c('CT1', 'Expelled', 'Fresh', 'Frozen', 'Mouse', 'Multi-Omics', 'Tip \n (-VE control)')))
+ggsave('reads_boxplot_log.png')
+
+
+## UMIS boxplot 
+cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  dplyr::select(UMIs, sample) %>%
+  dplyr::rename('Transcripts (UMIs)'=UMIs) %>%
+  tidyr::pivot_longer(., -c(sample), names_to='sample_type', values_to='value') %>% 
+  ggplot(.) +
+  geom_boxplot(mapping=aes(x=factor(sample), y=value, colour=sample)) +
+  facet_grid(~sample_type) +
+  labs(x='Sample type', y='UMI count')+
+  scale_y_log10()+
+  scale_x_discrete(labels=c(c('CT1', 'Expelled', 'Fresh', 'Frozen', 'Mouse', 'Multi-Omics', 'Tip \n (-VE control)')))
+ggsave('UMIS_boxplot_logscaled.png')
+
+
+### For bargraph
+df_reads <- cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  group_by(sample) %>% 
+  dplyr::summarise(Aligned=median(reads.used..aligned.to.genome),
+  UMIs=mean(UMIs)) %>% 
+  pivot_longer(., -sample, names_to='sample_type', values_to='value')
+
+# TO DO : FIX GRAPH FORMAT
+# compare aligned vs UMI's
+reads_umi_gg <- ggplot(df_reads, aes(x = factor(sample),y = value, fill=sample_type)) +
+  geom_bar(colour='black',stat="identity", position='dodge') + 
+  scale_fill_manual(values = c("#E41A1C","#377EB8"), labels = c("Aligned Reads", "UMIs")) +
+  themes +
+  coord_cartesian(ylim=c(0,3e+5))+
+  theme(legend.position=c(0.887, 0.89),
+    legend.margin = margin(6, 6, 6, 6), 
+    legend.title=element_blank(), 
+    axis.title.y = element_text(colour="grey20",size=12,face="bold"),
+    axis.text.x = element_text(colour="grey20",size=12,face="bold"),
+    axis.text.y = element_text(colour="grey20",size=12,face="bold"),  
+    axis.title.x = element_text(colour="grey20",size=12,face="bold")) +
+  labs(x='\nSample Type', y='Counts\n') +
+  scale_y_continuous(labels = scales::comma, breaks=c(0,50000,100000,150000,200000,250000,300000)) +
+  scale_x_discrete(labels=c(c('1um\nTip', 'Expelled \nvia \n syringe', 'Fresh', 'Frozen','Multi-Omics', 'Mouse', 'Tip \n (-ve control)')))
+ggsave('reads_vs_umis.png', reads_umi_gg)
+
+```
+
+```{r reads aligns vs umis scatterplot}
+## aligned / UMIs
+cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  dplyr::mutate(ratios=reads.used..aligned.to.genome/UMIs) %>%
+  dplyr::select(ratios, sample) %>%
+  tidyr::pivot_longer(., -c(sample), names_to='sample_type', values_to='value') %>% 
+  ggplot(.) +
+  geom_boxplot(mapping=aes(x=factor(sample), y=value, colour=sample)) +
+  labs(x='Sample type', y='Reads aligned/UMI')+
+  scale_y_continuous(labels = scales::comma, breaks=c(0,1,4,8,12,16,20))+
+  scale_x_discrete(
+    labels=c('CT1', 'Expelled', 'Fresh', 'Frozen', 'Mouse', 'Multi-Omics', 'Tip \n (-VE control)'))
+ggsave('reads_umis_ratio_boxplot.png')
+
+
+## scatter plots to show relationship between UMIS and reads i.e. if original transcripts (umis) have been amplified
+cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  dplyr::rename('Transcripts_UMIs'=UMIs, 'aligned'=reads.used..aligned.to.genome) %>%
+  dplyr::select(Transcripts_UMIs, aligned, sample) %>%
+  ggplot()+
+  geom_point(mapping=aes(x=Transcripts_UMIs, y=aligned, colour=sample)) +
+  facet_wrap(~sample)
+ggsave('reads_vs_umis_scatter.png')
+cell_metrics %>% 
+  mutate(sample=factor(sample_type)) %>% 
+  dplyr::rename('Transcripts_UMIs'=UMIs, 'aligned'=reads.used..aligned.to.genome) %>%
+  dplyr::select(Transcripts_UMIs, aligned, sample) %>% 
+  dplyr::filter(sample %in% c('CT1', 'tip')) %>%
+  ggplot() +
+  geom_point(mapping=aes(x=Transcripts_UMIs, y=aligned/Transcripts_UMIs, colour=sample)) +
+  scale_x_log10() + scale_y_log10()+
+  facet_wrap(~sample)
+ggsave('reads_vs_umis_scatter.png')
+
+```
+
+
+
+```{r Extract cell ids per sample - for UMI tools}
+
+cell_metadata <- str_split(cell_metrics$Cells, '_', simplify=T)
+cell_ids_list <- cell_metadata[,3]
+sample_type <- cell_metadata[,4]
+cell_ids <- cell_metrics %>% mutate(X=cell_ids_list, sample=sample_type)
+
+# merge cell metrics and UPX barcodes
+UPX_metrics <- merge(cell_ids, UPX_ids,by='X')
+
+# split on sample
+ids_by_sample <- UPX_metrics %>% dplyr::select(Cell.ID, sample) %>% group_split(sample) 
+
+save_file <- function(x){
+  filename <- paste0(x$sample[1], '_', 'ids.txt')
+  write.csv(x$Cell.ID, file =filename )
+}
+
+# save sample cell ids separately to txt files 
+lapply(ids_by_sample, save_file)
+
+```
+
+
+```{r format data}
+cell_metrics_df <- as.data.frame(cell_metrics)
+sample_type <- str_split(cell_metrics_df$Cells, simplify = T, '_')[,4]
+cell_metrics_df$sample_type <- sample_type
+```
+
+```{r Dunn pairwise test for comparing different groups}
+# adjust p-value for multiple comparisons
+dunn_test <- capture.output(dunn.test::dunn.test(cell_metrics_df$UMIs, cell_metrics_df$sample_type, method='bonferroni'))
+write.csv(dunn_test, 'dunn_test_groups.txt') 
+```
+
+
+```{r Load Count Matrix}
+# Store metadata in separate df 
+sce_df <- sce_mat[, !(colnames(sce_mat) %in% index_reads)] %>% 
+  dplyr::select(-c(gene.id, gene, strand, chrom, loc.5., loc.3.))
+
+
+rowdata <- sce_mat %>% # rowdata 
+  dplyr::select(gene.id, gene, chrom, loc.5., loc.3.) %>% 
+  mutate(length=abs(loc.5.-loc.3.))
+
+# Experiment object 
+sce_2 <- SingleCellExperiment(list(counts=as.matrix(sce_df)), 
+          rowData=DataFrame(rowdata),
+          colData=DataFrame(sample=factor(sample_type)),
+          metadata=list(study='ContaminationTest',
+                        cells='Human RPTEC'))
+
+
+# Make sure 1:1 mapping of ensID : Gene Symbols  / makes more user friendly                                       
+rownames(sce_2) <- rowdata$gene
+rownames(sce_2) <- uniquifyFeatureNames(rownames(sce_2), rowData(sce_2)$gene)
+```
+
+
+```{r QC}
+
+sce_2 <- sce_2[rowSums(counts(sce_2) > 0) > 0,] # RNU6-308P --> why always this gene
+mito.genes <- 100*(sum(grepl('^MT-', rownames(sce_2)))/nrow(sce_2)) # 36 mitochondrial genes detected across all groups 
+sce_2 <- addPerCellQC(sce_2, subsets=list(mito=grepl('^MT-', rownames(sce_2)), 
+                      ribo=grepl('^RP', rownames(sce_2))))
+QC_tab <- quickPerCellQC(colData(sce_2), batch=sce_2$sample, 
+                      percent_subsets=c('subsets_mito_percent', 'subsets_ribo_percent'))
+
+```
+
+```{r Seurat Obj for sanity check}
+mat <- sce_mat[,7:ncol(sce_mat)]
+rownames(mat) <- sce_mat$gene.id
+seurat.obj <- CreateSeuratObject(counts=mat, project = 'Contamination test', min.cells=2) %>% 
+  PercentageFeatureSet(., pattern = "^MT-", col.name='mito.percent') %>%
+  SCTransform(., variable.features.n = 1000,  verbose=F)
+seurat.obj$sample <- sample_type
+## 8522 features > 5 
+
+## PCA plot
+library(PCAtools)
+library(RColorBrewer)
+cc <- brewer.pal(8, 'Set2')
+p <- prcomp(t(mat[VariableFeatures(seurat.obj),]), center=F)
+ggbiplot(p, groups=seurat.obj$sample, choice=2:1, ellipse=F, labels=NULL, varname.size=NULL, var.axes=F, alpha=0) +
+  scale_color_discrete(name = '')  +
+  geom_point(aes(colour=seurat.obj$sample), size=2, shape=4) +
+  scale_colour_manual(values=c(cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]), 
+  guide = guide_legend(override.aes = list(size = 3), title='Sample')) +
+  coord_fixed(1)
+ggsave('pca_plot.png')
+DimPlot(seurat.obj, reduction = "pca", pt.size = 2, group.by='sample')
+```
+
+```{r mito vs UMIS}
+
+# outlier in fresh group with double RNA is 2 cells 
+# all multiomics within threshold 
+# similar material with expelled vs non-expelled
+# higher mito:UMIs for multiomics vs frozen 
+seurat.obj$multi <- seurat.obj$sample %in% 'multi'
+mito_umi <- FeatureScatter(seurat.obj, feature1='nCount_RNA', feature2='mito.percent', pt.size = 2, plot.cor = F, group.by='sample')  +
+  labs(y='% Mitochondrial Transcripts\n', x='\nTotal UMI Count', colour='Cells per Sample:') +
+  geom_hline(yintercept=20, linetype='dashed' ) +
+  theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  legend.position = 'bottom',
+  ) +
+  guides(col=guide_legend(ncol=3)) 
+ggsave('mito_vs_umi.png', mito_umi)
+
+## TSNE 
+seurat.obj <- seurat.obj %>% SCTransform(., verbose=F) %>% RunPCA(npcs=15) 
+ElbowPlot(seurat.obj)
+seurat.obj <- RunTSNE(seurat.obj, dims=1:5, perplexity=10)
+DimPlot(seurat.obj, pt.size=2)
+```
+
+```{r Check temposeq vs negative control of tip}
+
+# Split counts by samples
+split_matrix <- as.data.frame(counts(sce_2)) %>% dplyr::select(contains('cell')) %>% split.default(., sample_type) 
+tip_df <- split_matrix[['tip']]
+tip_df <- tip_df[rowSums(tip_df > 0) > 0,]
+tip_df
+
+# get genes detected by tip 
+rownames(tip_df)
+nrow(sce_mat)
+nrow(tip_df) # 8522
+nrow(tip_df) # 1611 Genes  
+
+
+# Genes detected -> negative control
+sc_specific_genes <- tip_df[!(rownames(tip_df) %in% filtered_df$gene),] # None of genes detected in negative control are in temposeq
+sc_specific_genes # All variation of single mitochondrial gene 
+sc_specific_genes # 260 genes specific to tip not found in temposeq data 
+common_tip_genes <- sc_specific_genes %>% filter_all(all_vars(. > 1)) # 8 MT-genes expressed commonly across all tips 
+knitr::kable(common_tip_genes, align=rep('c', 6), col.names = rep_names)
+
+
+
+```
+
+
+```{r technical noise between replicates of -ve control}
+
+tip_df <- tip_df %>% tibble::rownames_to_column(var='Gene')
+rep_names <- c('Replicate1', 'Replicate2', 'Replicate3', 'Replicate4', 'Replicate5', 'Replicate6')
+colnames(tip_df)[2:ncol(tip_df)] <- rep_names
+tip_df %>% ggplot(., aes(Replicate1, Replicate5)) + geom_point() + 
+  scale_x_continuous(trans=scales::pseudo_log_trans()) + scale_y_continuous(trans=scales::pseudo_log_trans())
+
+```
+
+
+
+```{r PCA of QC metrics}
+
+# PCA of QC 
+qc_sum <- cbind(QC_tab, colData(sce_2))
+unfiltered <- sce_2
+unfiltered <- runColDataPCA(unfiltered, 
+                            variable=list(
+                              'detected', 
+                              'subsets_mito_percent', 
+                              'subsets_ribo_percent', 'total'))
+seurat.obj@reductions[['colpca']] <- CreateDimReducObject(reducedDim(unfiltered), key='PC',
+                                                          assay=DefaultAssay(seurat.obj))
+DimPlot(seurat.obj, reduction='colpca', pt.size = 2)
+```
+
+```{r PCA plot }
+
+# samples with counts less than that in tip 
+unfiltered[, unfiltered$sample %in% 'tip']
+tip_max_counts <- max((colData(unfiltered)[colData(unfiltered)$sample %in% 'tip',])$total)
+rem <- colData(unfiltered)$total <= tip_max_counts
+sample_rem <- colData(unfiltered)[rem,]
+
+# df to plot
+col_pca_df <- data.frame(PC1=reducedDim(unfiltered)[,'PC1'], 
+                         PC2=reducedDim(unfiltered)[,'PC2'], 
+                         sample_type=sce_2$sample, 
+                         cell=colnames(sce_2)) 
+
+
+# TO DO :: COLOUR BY MORE METRICS
+# plot highlighting low count cells/ also highlight discarded cells
+ggplot(col_pca_df, aes(PC1, PC2)) +
+      geom_point(aes(colour=sce_2$sample), size=3)+
+      geom_point(size=3, shape=(shape=dplyr::case_when(col_pca_df$cell %in% rownames(sample_rem) ~ 
+                                                                   2))) + themes +
+      theme(legend.title = element_blank(),
+            legend.position = c(0.92,0.76), 
+            legend.box = 'black', 
+            legend.background = element_blank(),
+            legend.box.background = element_rect(colour = "black"))
+
+ggsave('pca_tip.png', pca_tip)
+
+```
+
+
+

@@ -1,0 +1,258 @@
+---
+title: "Pseudotime Trajectories"
+output: html_notebook
+package: Using Monocle
+Data Description: Deng Dataset  
+---
+```{r Packages}
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+library(monocle)
+library(ggbeeswarm)
+library(scRNAseq)
+library(forcats)
+library(TSCAN)
+library(ggplot2)
+library(scater)
+library(gam)
+library(ggrepel)
+library(tidyr)
+library(dplyr)
+library(RColorBrewer)
+
+```
+
+
+
+```{r Pseudotime Vignette : PCA}
+deng.sce <- library(singleCellRNASeqMouseDeng2014)
+deng.sce <- Deng2014MouseESC
+
+# Label with Cell types 
+deng.sce$cell_type<- factor(
+    deng.sce$cell_type,
+    levels = c("zy", "early2cell", "mid2cell", "late2cell",
+                        "4cell", "8cell", "16cell", "earlyblast",
+                        "midblast", "lateblast")
+)
+
+# Get Read matrix 
+cellLabels <- deng.sce$cell_type
+deng <- as.matrix(deng.sce@assayData$exprs , sparse=TRUE)
+
+# Convert to SCE
+deng.sce <- SingleCellExperiment(list(counts=deng), 
+                                 colData=DataFrame(cell_type=cellLabels))
+deng.sce <- logNormCounts(deng.sce)
+
+# Dimensionality reduction
+deng.sce <- scater::runPCA(deng.sce,ncomponents = 5)
+
+# Approx pseudotime ordering 
+pca_df <- data.frame(PC1 = reducedDim(deng.sce,"PCA")[,1],
+                     PC2 = reducedDim(deng.sce,"PCA")[,2],
+                     cell_type2 = deng.sce$cell_type)
+
+# 1st PC against Pseudotime i.e. diff pathway 
+ggplot(pca_df, aes(x = PC1, y = cell_type2, 
+                              colour = cell_type2), size=0.9, alpha=1/6) +
+    geom_quasirandom(groupOnX = FALSE, width=0.6) + theme_classic() +
+    labs( x="First principal component - 33% Variance", y="Pseudotime point",
+          title="Cells ordered by first principal component", colour='Cell Type')
+ggsave('Trajectory_ANALYSIS/PC_time.png')
+
+
+
+
+
+```
+
+```{r Pseudotime Grun Pancreas}
+# Approx Psuetotime Ordering 
+pca_df1 <- data.frame(PC1 = reducedDim(sce_Gn,"Horns_PCA")[,1],
+                      PC2 = reducedDim(sce_Gn,"Horns_PCA")[,2],
+                      cell_type = sce_Gn$Cluster_id)
+pca_df1 <- pca_df1 %>% 
+                dplyr::mutate(order_cell =fct_reorder(cell_type, PC1))
+              
+
+# 1st PC against Pseudotime i.e. diff pathway 
+ggplot(pca_df1, aes(x = PC1, y = order_cell, 
+                              colour = cell_type)) +
+    geom_quasirandom(groupOnX = FALSE, width=0.6) + 
+    theme_classic() +
+    labs( x="PC1: 26% Variance", y="Pseudotime point",
+          title="Cells ordered by first principal component", colour='Cell Type') +
+          guides(alpha=FALSE, color=guide_legend(override.aes = list(size=3, 
+                                                                     alpha=1)))
+ggsave('Trajectory_ANALYSIS/PC_time_Grun.png')
+
+
+```
+
+
+```{r Pseudotime Vignette: TSCAN }
+
+# TSCAN Clustering 
+mst.deng <- createClusterMST(deng.sce, clusters=deng.sce$cell_type, use.dimred='PCA')
+plot(mst.deng)
+ggsave('Trajectory_ANALYSIS/mst_clust_deng.png')
+
+# Visuaise MST on PCA
+line.data <- reportEdges(deng.sce, mst=mst.deng, clusters=deng.sce$cell_type, 
+                           use.dimred="PCA")
+plotPCA(deng.sce, colour_by='cell_type') + 
+        geom_line(data=line.data, mapping=aes(PC1, PC2,group=edge))
+
+
+# Project cells onto MST
+map.tscan <- mapCellsToEdges(deng.sce, mst=mst.deng, clusters=deng.sce$cell_type, 
+                           use.dimred="PCA")
+
+# Compute Pseudotime for each cell through MST 
+tscan.pseudo <- TSCAN::orderCells(map.tscan, mst=mst.deng, start='zy')
+
+common.pseudo <- rowMeans(tscan.pseudo, na.rm=TRUE)
+plotPCA(deng.sce, colour_by=I(common.pseudo), 
+        text_by="cell_type", text_size=4) +
+    geom_line(data=line.data, mapping=aes(x=PC1, y=PC2, group=edge))
+
+
+
+```
+
+
+```{r Pseudotime Pancreas: TSCAN}
+
+# TSCAN clustering
+mst.grun <- createClusterMST(sce_Gn, clusters=sce_Gn$Cluster_id, use.dimred='Horns_PCA')
+plot(mst.grun)
+png('Trajectory_ANALYSIS/mst_grun_PCA.png')
+
+#Visualise MST on TSNE
+line.grun <- reportEdges(sce_Gn, mst=mst.grun, clusters=sce_Gn$Cluster_id, 
+                         use.dimred='TSNE')
+plotTSNE(sce_Gn, text_by="Cluster_id") +
+    geom_line(data=line.grun, mapping=aes(x=dim1, y=dim2, group=edge))
+ggsave('Trajectory_ANALYSIS/TSCAN_TSN_GRUN.png')
+
+
+# Project cells onto MST 
+map.tscan_grun <- mapCellsToEdges(sce_Gn, mst=mst.grun, clusters=sce_Gn$Cluster_id,
+                                  use.dimred='Horns_PCA')
+
+# Compute pseudotime fo each cell along MST 
+tscan.pseudo_Grun <-  TSCAN::orderCells(map.tscan_grun, mst=mst.grun)
+sce_Gn$common.pseudo_Grun <- rowMeans(tscan.pseudo_Grun, na.rm=TRUE)
+plotTSNE(sce_Gn, colour_by=I(common.pseudo_Grun), 
+         text_by='Cluster_id', text_size=4) + 
+  geom_line(data=line.grun, mapping=aes(x=dim1, y=dim2, group=edge)) + coord_fixed(1)
+
+
+# Cells ordered by pseudotime 
+as.data.frame(colData(sce_Gn)) %>% 
+  dplyr::mutate(Cluster_id =fct_reorder(Cluster_id, common.pseudo_Grun)) %>% 
+ggplot(., aes(x = common.pseudo_Grun, 
+           y = Cluster_id, colour = Cluster_id)) +
+    geom_quasirandom(groupOnX = FALSE) + 
+    theme_classic() +
+    xlab("TSCAN pseudotime") + ylab("Cell Type")
+ggsave('Trajectory_ANALYSIS/TSCAN_Grun_pseudo_cells.png')
+
+
+```
+
+
+```{r Pseudotime Pancreas: Slingshot}
+
+# Get linages from reducedDIM
+set.seed(1)
+lineages <- getLineages(reducedDim(sce_Gn, 'Horns_PCA'), clusterLabels = 
+                          sce_Gn$Cluster_id)
+
+# Smooth Lineage curves & pseduotime?? ----
+curves <- getCurves(lineages)
+
+# Show Curves on PCA
+plot(UMAP_int, col=I(sce_Gn$Cluster_id), pch=16, cex=0.9)
+lines(curves)
+
+
+# Embed Curves in UMAP ---- 
+pseudo <- slingPseudotime(curves)
+shared.pseudo <- rowMeans(pseudo, na.rm=TRUE)
+embedded <- embedCurves(curves, as.matrix(UMAP_int))
+embedded <- slingCurves(embedded)
+
+# Name list for different coloured curves 
+names(embedded) <- c('blue','black','green', 'pink', 'red', 'grey', 'orange')
+
+# umap_1_int plot
+new_umap <- umap_1_int+ 
+  geom_text_repel(data=cell_umap_lab, aes(label=clusters,x,y),
+                box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, nudge_y = 
+                  -0.1) + theme(legend.position='bottom')
+
+# Map trajectories onto map 
+purrr::imap(list(embedded), ~.y, function(path){
+  tmpembedded <- data.frame(path$s[path$ord,])
+  new_umap <- new_umap + geom_path(data=tmpembedded, aes(x=Dim.1, y=Dim.2), colour=.y, 
+                                   size=0.9)
+})
+new_umap
+
+new_umap
+ggsave('Trajectory_ANALYSIS_UMAP_slingshot.png')
+
+# Plot pseudotime vs cell 
+lineages@slingParams$sharedpseudo <- shared.pseudo
+slingshot_df <- data.frame(cell_type=sce_Gn$Cluster_id, pseudo=shared.pseudo) %>% 
+dplyr::mutate(cell_type =fct_reorder(cell_type, pseudo))
+ggplot(slingshot_df, aes(x=pseudo, y=cell_type, colour=cell_type)) +
+    geom_quasirandom(groupOnX = FALSE) + theme_classic() +
+    xlab("First Slingshot pseudotime") + ylab("cell type") +
+    ggtitle("Cells ordered by Slingshot pseudotime")
+ggsave('Trajectory_ANALYSIS_slingshot_pseudo.png')
+
+```
+
+```{r Identifying temporaly expressed genes using a GAM}
+# Fit Each Gene to GAM with a pseudotime loess term
+t <- shared.pseudo
+
+
+# Look at top 100 Genes 
+hvg100 <- gene_meta %>% 
+  arrange(desc(sct.residual_variance)) %>% 
+  slice_head(n=100)
+sce_100 <- sce_Gn[which(rownames(sce_Gn) %in% hvg100$Gene),]
+Y <- log1p(logcounts(sce_100))
+
+# Apply GAM
+p <- vector()
+gam.pval <- apply(Y, 1, function(z){
+  d <- data.frame(z=z, t=t)
+  suppressWarnings({
+    tmp <- gam(z~lo(t), data=d)
+  })
+  p <- summary(tmp)[3][[1]][2,3]
+  p
+})
+
+
+# Plot 100 genes expression
+topgenes <- names(sort(gam.pval, decreasing = FALSE))[1:50]
+
+# Format data for heatmap / top var genes & reordered clus
+heatdata <-logcounts(sce_100)[topgenes, order(t, na.last=NA)]
+heatclus <- sce_100$Cluster_id[order(t, na.last=NA)]
+colnames(heatdata) <- heatclus
+# Plot heatmap
+ce1 <- clusterExperiment::ClusterExperiment(heatdata, heatclus)
+plotHeatmap(ce1, breaks=0.90,
+            main='Heatmap of DE Genes \n ordered by pseudotime: Values \n capped at 0.9 Quantile of max value', clusterSamplesData='primary')
+png('Trajectory_ANALYSIS/HEATMAP_DEG.png', width=480, height=480)
+
+```
+

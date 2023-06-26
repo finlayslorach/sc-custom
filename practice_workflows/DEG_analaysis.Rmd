@@ -1,0 +1,533 @@
+---
+title: "Pseudobulk DE analysis with DEseq2"
+output: html_notebook
+Workflow: 'Create Matrix of Cell_id|Sample|Donor for each Cell type --> Feed into DEseq --> Loop over all Clusters'
+---
+
+```{r Load Packages }
+library(ggplot2)
+library(scran)
+library(scater)
+library(DESeq2)
+library(dplyr)
+library(magrittr)
+library(edgeR)
+library(SingleCellExperiment)
+library(Matrix.utils)
+library(Matrix)
+library(tidyr)
+library(tibble)
+library(scde)
+```
+
+```{r SC3 Clustering on Non-Integrated Data}
+# Single Cell Consensus Clustering , k=9 prior
+rowData(sce_Gn)$feature_symbol <- rownames(sce_Gn)
+logcounts(sce_Gn) <- as.matrix(logcounts(sce_Gn))
+sce_Gn <- sc3(sce_Gn, ks=9,  n_cores=1, biology=TRUE, gene_filter = FALSE) 
+
+```
+
+```{r Create Seurat Clusters for PPY/Epsilon}
+
+# Create Cluster for PPY & ESAM
+PPY=as.numeric(logcounts(sce_Gn[c('PPY'),]))
+ESAM=as.numeric(logcounts(sce_Gn[c('ESAM'),]))
+
+df_orig <-as.data.frame(TSNE_1) %>% 
+          mutate(ori_clusters=as.numeric(louv_clust)) %>% 
+          mutate(PPY=PPY) %>% 
+          mutate(ESAM=ESAM)
+df_orig[which(df_orig$PPY > max(PPY) * 0.85), 3] <- 8
+df_orig[which(df_orig$ESAM > max(ESAM) * 0.7), 3] <- 9
+df_orig$ori_clusters <- as.factor(df_orig$ori_clusters)
+
+
+# Get Cell Type for each Cell
+df_orig <- df_orig %>%
+          mutate(cell_id=recode_factor(ori_clusters, '1'='PGM5P2','2'='Acinar', 
+                                       '3'='UNC5B',
+                            '4'='Alpha', '5'='Ductal','6'= 'Beta','7'='Delta','8'= 
+                              'PPY','9'= 'ESAM')) %>% 
+          dplyr::select(V1,V2,ori_clusters,cell_id)
+
+# Cell Type Labels
+df_ori_lab$clusters <- df_orig %>% 
+                group_by(cell_id)  %>% 
+                summarise(x=mean(V1), y=mean(V2))
+
+
+```
+
+```{r Donor Variation TSNE Graph}
+# TSNE Plot of Donor Variation
+set.seed(1)
+sce_Gn <- runTSNE(sce_Gn, ntop=FALSE, perplexity=perplexity, max_iter=maxiter, dimred='Horns_PCA')
+plotReducedDim(sce_Gn, dimred='TSNE', colour_by = 'Donor', point_size=0.9, point_alpha=1/4) + coord_fixed(1) +
+  guides(shape=FALSE, alpha=FALSE, color=guide_legend(ncol=2, override.aes = list(size=3, alpha=1.5))) +   
+  ggrepel::geom_text_repel(data=df_ori_lab$clusters, aes(label=cell_id,x,y),
+                  box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, nudge_y = -0.1) +
+  viridis::scale_color_viridis(discrete = TRUE, option = "D")
+
+```
+
+```{r Get Metrics to Aggregate Cells on}
+
+# Clean ColData 
+colData(sce_Gn) %>% 
+  as.data.frame %>% 
+  dplyr::transmute(
+    Donor,
+    Sample,
+    Donor_Sample_id = Sample_Donor,
+    Cluster_id=df_orig$cell_id
+    ) %>% 
+  mutate_all(as.factor) %>% 
+  magrittr::set_rownames(colnames(sce_Gn)) %>% 
+  DataFrame -> colData(sce_Gn)
+
+
+# Positions to aggregate on - # of cells in each Sample 
+m <- match(sids, sce_Gn$Donor_Sample_id)
+n_cells <- as.numeric(table(sce_Gn$Donor_Sample_id))
+
+(agg <- data.frame(colData(sce_Gn)[m,],
+                  n_cells, row.names=NULL) %>% 
+                  select(-'Cluster_id'))
+
+# Filter Small Samples
+agg <- agg %>% filter(n_cells >= 10)
+
+```
+
+```{r Create Object of Pseudo-bulk Counts}
+
+# QC to filter low Genes - GO BACK AND DO THIS STEP FOR WHOLE ANALYSIS 
+sce_Gn <- sce_Gn[rowSums(counts(sce_Gn) > 1) >= 10, ]
+
+
+# Cell Type x Gene Matrix 
+groups <- colData(sce_Gn)[, c('Cluster_id', 'Donor_Sample_id')]
+agg_sce <- Matrix.utils::aggregate.Matrix(t(counts(sce_Gn)),
+                            groupings =groups, fun='sum') 
+
+# Determine what Cell Types are present in each Sample
+splitf <- sapply(stringr::str_split(rownames(agg_sce),
+                                             pattern='_',
+                                             n=2),
+                                    '[', 1)
+# Split by Cell Type for DEG Analysis                                  
+agg_sce <- split.data.frame(agg_sce, factor(splitf)) %>% 
+        lapply(function(u) magrittr::set_colnames(t(u), 
+                                              stringr::str_extract(rownames(u),'(?<=_).*')))
+
+
+
+```
+
+```{r Getting Sample Level Metadata}
+# Sample Names in each of Cell Type Clusters 
+get_sample_ids <- function(x){
+                    agg_sce[[x]] %>% colnames()
+}
+de_samples <- purrr::map(1:length(kids), get_sample_ids) %>%
+        unlist()
+
+# List of Samples in each cluster
+samples_list <- purrr::map(1:length(kids), get_sample_ids)
+
+# For each Sample replace with Appropriate Cell Type 
+get_cluster_ids <- function(x){
+        rep(names(agg_sce)[x], 
+            each = length(samples_list[[x]]))
+}
+de_cluster_ids <- purrr::map(1:length(kids), get_cluster_ids) %>%
+        unlist()
+
+# MetaData - combine Sample & Clusters with Donor 
+gg_df <- data.frame(cluster_ID = de_cluster_ids, 
+                    Donor_Sample_id = de_samples)
+metadata <- dplyr::left_join(gg_df, agg[, c('Donor', 'Donor_Sample_id')],
+                            by='Donor_Sample_id') %>% 
+                            filter(!is.na(Donor)) %>% 
+                            mutate_all(as.factor)
+              
+
+
+
+```
+
+```{r Combining Metadata & Counts Acinar Cells }
+
+# Subset Beta Cells Metadata
+clusters <- levels(metadata$cluster_ID)
+cluster_metadata <- metadata[which(metadata$cluster_ID == clusters[3]), ]
+rownames(cluster_metadata) <- cluster_metadata$Donor_Sample_id
+
+# Subset Gene Counts to Beta Cells
+counts <- agg_sce[[clusters[3]]]
+
+# Get Cluster Counts for Cells in Sample
+cluster_counts <- data.frame(counts[, which(colnames(counts) %in% rownames(cluster_metadata))])
+
+```
+
+```{r DEseq Object for Beta to Assess Similarity between Samples}
+dds <- DESeqDataSetFromMatrix(cluster_counts, colData = cluster_metadata,
+                              design= ~ Donor)
+
+# Distances between Rows for Data Vis
+rld <- rlog(dds, blind=TRUE)
+SampleDists <-  as.matrix(dist(t(assay(rld))))
+mds <- data.frame(cmdscale(SampleDists))
+mds <- cbind(mds, colData(rld))
+ ggplot(mds) + geom_point(aes(X1,X2,color=Donor), size=4) + labs(title='MDS Plot: Beta Cells',
+                                                                xlab='MDS_1',
+                                                                ylab='MDS_2')
+ggsave(paste0("results/", clusters[3], "_specific_MDSplot.png"))
+
+
+# Hierachal Clustering 
+rld_mat <- assay(rld)
+rld_cor <- cor(rld_mat)
+# Heatmap 
+pheatmap::pheatmap(rld_cor, annotation=cluster_metadata[, c('Donor'), drop=F])
+```
+
+```{r Running DEseq Beta Cells}
+# Differential Expression Analaysis 
+dds$Donor <- relevel(dds$Donor, ref = "D17")
+dds <- DESeq(dds)
+
+# Dispersion Estimates 
+plotDispEsts(dds)
+
+# Results table for D3 vs D10
+resultsNames(dds)
+res <- results(dds, name='Donor_D7_vs_D17')
+res <- lfcShrink(dds, coef = 'Donor_D7_vs_D17', type = 'apeglm', res = res)
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+# Filter Table based on Significance Threshold 
+padj_cutoff <- 0.05
+sig_res <- dplyr::filter(res_tbl, padj < padj_cutoff) %>%
+        dplyr::arrange(padj)
+
+# Get Top 20 Genes 
+norm_counts <- counts(dds, normalized=TRUE)
+top20_sig_genes <- sig_res %>%
+        dplyr::arrange(padj) %>% 
+        dplyr::pull(gene) %>%
+        head(n=20)
+top20_sig_norm <- data.frame(normalized_counts) %>% 
+    rownames_to_column(var='gene') %>% 
+    dplyr::filter(gene %in% top20_sig_genes)
+
+# Nice Data frame of Sample_id and Counts for Plotting
+gathered_top20_sig <- top20_sig_norm %>%
+        gather(colnames(top20_sig_norm)[2:length(colnames(top20_sig_norm))], key = "samplename", value =
+                "normalized_counts")
+
+# Join with Metadata 
+agg <- agg %>% 
+  mutate(Donor_Sample_id=stringr::str_replace_all(Donor_Sample_id, ' |,', '.'))
+gathered_top20_sig <- inner_join(agg[, c('Donor', "Sample", "Donor_Sample_id" )], gathered_top20_sig, by = 
+                                   c("Donor_Sample_id"                                                      
+                                     ="samplename"))
+
+```
+
+```{r DE Plots for Acinar Cells}
+gathered_top20_sig %>% filter(Donor %in% c('D7', 'D17')) %>% 
+      ggplot() +
+        geom_point(aes(x = gene, 
+                       y = normalized_counts+1, 
+                       color = Donor), 
+                   position=position_jitter(w=0.1,h=0)) +
+        scale_y_log10() +
+        xlab("Genes") +
+        ylab("log10 Normalized Counts") +
+        ggtitle("Top 20 Significant DE Genes in Beta Cells") +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+        theme(plot.title = element_text(hjust = 0.5))
+ggsave(paste0("results/", clusters[3], "top20.png"))
+
+
+res_table_thres <- res_tbl %>% 
+                  mutate(threshold = padj < 0.05) 
+labels_DE <- res_table_thres %>% 
+            arrange(desc(log2FoldChange)) %>% 
+            slice_head(n=5) 
+                  
+## Volcano plot
+ggplot(res_table_thres) +
+    geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+    ggtitle("Volcano plot of DE Genes in Acinar cells") +
+    xlab("log2 fold change") + 
+    ylab("-log10 adjusted p-value") +
+    scale_y_continuous(limits = c(0,50)) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25))) + 
+    ggrepel::geom_text_repel(data=labels_DE, aes(label=gene,log2FoldChange,-log10(padj)),
+                  box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, nudge_y = -0.1)
+ggsave(paste0("results/", clusters[3], "volcano.png"))
+
+```
+
+```{r DE Cell test for Main Cell Types}
+# Acinar 
+purrr::map(1, get_dds_resultsD17vsD7, contrast = 'Donor_D3_vs_D7', ref='D7', n=20, A='D13', B='D7')
+
+# Alpha 
+purrr::map(2, get_dds_resultsD17vsD7, contrast = 'Donor_D10_vs_D7', ref='D7', n=10, A='D10', B='D7')
+
+# Beta 
+purrr::map(3, get_dds_resultsD17vsD7, contrast = 'Donor_D17_vs_D7', ref='D7', n=20, A='D17', B='D7')
+
+# Delta 
+purrr::map(4, get_dds_resultsD17vsD7, contrast = 'Donor_D17_vs_D7', ref='D7', n=20,A='D17', B='D7')
+
+# Ductal 
+purrr::map(5, get_dds_resultsD17vsD7, contrast = 'Donor_D7_vs_D17', ref='D7', n=20,A='D7', B='D17')
+
+
+
+```
+
+```{r Plot DE Genes}
+DE_genes <- c('MTRNR2L10', 'AGT', 'PPY', 'XIST')
+purrr::map(DE_genes, function(marker){
+  as.data.frame(TSNE_1) %>% 
+    dplyr::mutate(gene=as.numeric(logcounts(sce_Gn[marker,]))) %>%
+    ggplot(., aes(V1, V2)) + 
+    theme_classic() + 
+    labs(x='TSNE_1',
+         y='TSNE_2',
+         title=marker) + 
+    geom_point(aes_string(color='gene'), size=0.7, alpha=0.8) +
+    scale_color_viridis_c() +
+    theme(plot.title = element_text(face='plain', size=9)) +
+    ggrepel::geom_text_repel(data=df_ori_lab$clusters, aes(label=cell_id,x,y),
+                  box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, nudge_y = -0.1)
+}) %>%
+      cowplot::plot_grid(plotlist=.) 
+
+
+```
+
+SCDE: TAKES AGES 
+
+```{r Compare}
+# From cytobank.R 
+names(donor_sce) <- Donors
+c.groups <- sce_Gn$Cluster_id
+
+# Convert counts to integer for scde fitting
+sce_counts <-apply(counts(sce_Gn),2,function(x) 
+  {storage.mode(x) <- 'integer'; x})
+err_fit <- scde.error.models(counts = sce_counts, groups = c.groups, n.cores = 1, threshold.segmentation = TRUE, save.crossfit.plots = FALSE, save.model.plots = FALSE, verbose = 1)
+
+```
+
+```{r Wilcox test - Between Ductal D7/D17 vs All Donors - Attempt 1}
+# Subset Beta Cells Metadata
+clusters <- levels(metadata$cluster_ID)
+cluster_metadata1 <- metadata[which(metadata$cluster_ID == 'Ductal'), ]
+rownames(cluster_metadata1) <- cluster_metadata1$Donor_Sample_id
+
+# Subset Gene Counts to Beta Cells
+counts1 <- agg_sce[['Ductal']]
+
+# Get Cluster Counts for Cells in Sample
+cluster_counts1 <- data.frame(counts1[, which(colnames(counts1) %in% rownames(cluster_metadata1))])
+
+# DF of Donors in Ductal Cells 
+donor <- levels(factor(Donor))
+test <- purrr::map(donor, function(x){
+    cluster_counts1 %>% 
+    as.data.frame() %>%
+    select(contains(x)) %>% 
+    transmute(!!x := rowSums(.)) 
+}) 
+
+# Wilcoxon Test D3/D7
+X <- t(cbind(test[[4]])) %>% as.data.frame() 
+Y <- t(test[[5]]) %>% as.data.frame()
+colnames(X) <- rownames(cluster_counts)
+wilcox_stat <- vector()
+p <- vector()
+fc <- vector()
+for(i in 1:dim(X)[2])
+{
+  wilcox_output<-wilcox.test(as.numeric(unlist(X[,i])), as.numeric(unlist(Y)), exact=FALSE)
+  wilcox_stat<-append(wilcox_stat,as.numeric(wilcox_output$statistic))
+  fc <-append(fc,mean(as.numeric(unlist(X[,i])))/mean(as.numeric(unlist(Y))))
+  p<-append(p,as.numeric(wilcox_output$p.value))
+}
+
+output_wilcox_univar<-data.frame(GENE=colnames(X),MWU_STAT=wilcox_stat,
+                                 FC=fc,PVALUE=p)
+output_wilcox_univar$LOGFC<-log(output_wilcox_univar$FC)
+output_wilcox_univar$FDR<-p.adjust(output_wilcox_univar$PVALUE,method='fdr')
+output_wilcox_univar<-output_wilcox_univar[order(output_wilcox_univar$FDR,
+                                                 output_wilcox_univar$PVALUE),]
+output_wilcox_univar_fdr<-output_wilcox_univar[output_wilcox_univar$FDR<0.05,]
+head(output_wilcox_univar_fdr,10)
+write.table(head(output_wilcox_univar), file='results/wilcox_gene_D3_D7')
+output_wilcox_univar <- output_wilcox_univar %>% 
+                          mutate(threshold=FDR < 0.05)
+wilcox_labels <- output_wilcox_univar %>% 
+          arrange(desc(LOGFC)) %>% 
+          slice_head(n=5) 
+# Volcano plot
+ ggplot(output_wilcox_univar) +
+    geom_point(aes(x = LOGFC, y = -log10(FDR), colour = threshold)) +
+    ggtitle(paste0("Volcano plot of DE Genes in ",  clusters[5], " cells")) +
+    xlab("log2 fold change") + 
+    ylab("-log10 adjusted p-value") +
+    scale_y_continuous(limits = c(0,50)) +
+   theme_classic() +
+    theme(legend.position = "none",
+          plot.title = element_text(size = rel(1.5), hjust = 0.5),
+          axis.title = element_text(size = rel(1.25))) + 
+    ggrepel::geom_text_repel(data=wilcox_labels, aes(label=GENE,LOGFC,-log10(FDR)),
+                             box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, nudge_y = -0.1)
+  ggsave(paste0("results/", clusters[5], "volcano.png"))
+  
+
+
+# Get Cluster Counts for Cells in Sample
+ductal_heatmap <- counts1[, which(colnames(counts1) %in% rownames(cluster_metadata1))]
+ductal_heatmap_top_genes <- ductal_heatmap[which(rownames(ductal_heatmap) %in% 
+                                                   output_wilcox_univar[1:15,]$GENE),]
+
+dds_ductal <- DESeqDataSetFromMatrix(ductal_heatmap, colData = cluster_metadata,
+                              design= ~ Donor)
+dds_ductal <- DESeq(dds_ductal)
+
+# Plot heatmap
+min_c <- min(abs(DUCTAL_D3_D7_COUNTS))
+max_c <- max(abs(DUCTAL_D3_D7_COUNTS)) * 0.8
+breaks <- seq(min_c, max_c, length.out = 100)
+
+(DUCTAL_D3_D7_COUNTS <- as.matrix(counts(dds_ductal,normalized=TRUE))[output_wilcox_univar$GENE[1:10],10:17])
+pheatmap::pheatmap(DUCTAL_D3_D7_COUNTS, breaks=breaks, main='DE between D3 and D7 in Ductal Cells:\nGenes Identified from Wilcoxon Test')
+png('results/DE_d3_D7_heatmap.png')
+
+write.table(wilcox_labels, 'results/wilcox_1_d3_d7')
+```
+
+
+```{r Wilcoxon test attempt 2 D3vsD7}
+
+# D3 VS D7
+names(test) <- donor
+d3_d7_df <- cbind(D3=test$D3, D7=test$D7)
+rownames(d3_d7_df) <- rownames(sce_Gn)
+d3_d7_df <- t(as.matrix(d3_d7_df))
+
+
+# Wilcoxon pairwise test 
+pVals <- apply(
+    t(d3_d7_df), 1, function(x) {
+        wilcox.test(
+            x['D7'],
+            x['D3'],exact=FALSE
+        )$p.value
+    }
+)
+
+# multiple testing correction
+pVals <- p.adjust(pVals, method = "fdr")
+output_wilcox_univar_2<-data.frame(GENE=rownames(d3_d7_df),PVALUE=pVals)
+
+output_wilcox_univar
+
+write.table(output_wilcox_univar, 'results/wilcox_D2_D7') 
+
+```
+
+
+```{r Scran Ductal}
+# Wilcoxon Test
+donor_sce <- sce_Gn[which(sce_Gn$Cluster_id == 'Ductal')]
+colLabels(donor_sce) <- donor_sce$Donor
+Ductal_DE <- findMarkers(donor_sce, test.type='wilcox', pval.type='some')
+D17_duct <- Ductal_DE$D17 
+D7_duct <- Ductal_DE$D7
+
+# D7 as Ref
+D7_duct <- D7_duct %>% 
+  as.data.frame() %>% 
+  arrange(-summary.AUC, FDR) %>% 
+  slice_head(n=15)
+
+D17_duct  
+# Heat Map of genes across Ductal Cells 
+AUCs <- getMarkerEffects(D7_duct, prefix="AUC") %>% as.data.frame() %>% 
+      rownames_to_column('Gene') %>% 
+      pivot_longer(!Gene, names_to='Donor',values_to='AUCs')
+
+D7_D17_AUC <- ggplot(AUCs) +
+  geom_tile(aes(y=Gene, x=Donor, fill=AUCs), color='black')+
+  scale_fill_viridis_c() +
+  theme_classic() +
+  labs(title='Ductal: DE in D7 vs Other Donors',
+       x='Donor',
+       y='Gene',
+       fill='AUC Score',
+       subtitle = 'Wilcoxon pariwise tests') + theme(
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        axis.title = element_text(size = rel(1.25)))
+```
+
+```{r Plot Scran}
+DE_genes <- c('MTRNR2L10', 'XIST', 'SPP1')
+purrr::map(DE_genes, function(marker){
+  as.data.frame(TSNE_1) %>% 
+    dplyr::mutate(gene=as.numeric(logcounts(sce_Gn[marker,]))) %>%
+    ggplot(., aes(V1, V2)) + 
+    theme_classic() + 
+    coord_fixed(1) +
+    labs(x='TSNE_1',
+         y='TSNE_2',
+         title=marker) + 
+    geom_point(aes_string(color='gene'), size=0.85, alpha=0.8) +
+    scale_color_viridis_c() +
+    theme(plot.title = element_text(face='plain', size=9)) +
+    ggrepel::geom_text_repel(data=df_ori_lab$clusters, aes(label=cell_id,x,y),
+                  box.padding = 0.4,max.overlaps=Inf, size=3, nudge_x = 0.2, 
+                  nudge_y=-0.1)
+}) %>%
+      cowplot::plot_grid(plotlist=.) 
+
+
+```
+
+```{r SCDE}
+# Convert ductal cell count to integer 
+donor_scde <-apply(as.matrix(counts(donor_sce)),2,function(x) 
+  {storage.mode(x) <- 'integer'; x})
+
+sg <- factor(gsub("(D7|D17|D3|D10|D2).*", "\\1",                                     colnames(donor_scde)),                                 levels=c('D7','D17','D3','D10','D2'))
+
+
+# Name factor with colnames of SCE 
+names(sg) <- colnames(donor_scde)
+err.fit <- scde.error.models(counts = donor_scde, 
+                             groups = sg, n.cores = 1, 
+                             threshold.segmentation = TRUE, 
+                             save.crossfit.plots = FALSE, 
+                             save.model.plots = FALSE, 
+                             verbose = 1, min.size.entries = 300,
+                             min.count.threshold = 1)
+
+
+```
+

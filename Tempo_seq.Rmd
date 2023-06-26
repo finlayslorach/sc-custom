@@ -1,0 +1,148 @@
+---
+title: "TempoSeq Data"
+output: html_notebook
+---
+
+TODO:
+* SAVE PLOTS
+* CHANGE TO PADJ VALUE
+* CHECK HEATMAP/REDO
+
+```{r Loading Data}
+root <- '/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_3_Cisplatin_080721/Secondary_analysis'
+DEG <- read.csv(paste0(root, '/new_tables/Tempo_seq_analysis/DEG_tempo.csv'))
+count_mat <- read.csv(paste0(root, '/new_tables/Tempo_seq_analysis/Claires_data/tempo_seq_full_matrix.csv'))
+cc <- c(brewer.pal(8, "Set1"))
+```
+
+```{r Format Data}
+# TO DO CHECK
+mat <- count_mat %>% 
+  set_rownames(make.unique(str_split(.$X, '_', simplify=T)[,1])) %>% 
+  dplyr::select(c(contains('10_uM_Cisplatin'), contains('NaCl'))) 
+sample <- str_extract(colnames(mat), '(Cisplatin|NaCl)_\\d+_h')
+```
+
+```{r Filter on concentration and get top markers by pvalue}
+# 8hr, 24hr,72hr
+DEG <- DEG %>% 
+  dplyr::filter(CONCENTRATION=='10uM', COMPOUND=='CISPLATIN', SPECIES=='Human') 
+top_markers <- DEG %>% 
+  group_by(TIME) %>% 
+  dplyr::filter(rank(padj, ties.method='first') <= 10)
+```
+
+```{r Apply limma pipeline}
+# calc norm factors is from limma (for microarray(probe) data)
+# Timepoint for 10uM concentration
+temp <- DGEList(counts=mat)
+temp <- calcNormFactors(temp)
+temp$samples$time <- str_extract(str_extract(rownames(temp$samples), '_\\d+_h'), '\\d+')
+
+## plot with labels 
+temp$samples$sample <- paste0(str_split(rownames(temp$sample),'_',simplify=T)[,4], '_',
+  str_split(rownames(temp$sample),'_',simplify=T)[,5]) 
+#png(paste0(root, '/new_visualisations/Tempo_seq_Analysis/PCA_allcounts_col_by_sample_10uM.png'))
+plotMDS(temp, pch=19, gene.selection='common', col=cc[factor(temp$samples$sample)])
+legend("topright", legend=levels(factor(temp$samples$sample)), fill=cc, cex=1)
+
+## plot coloured by timepoint
+#png(paste0(root, '/new_visualisations/Tempo_seq_Analysis/PCA_allcounts_col_by_time_10uM.png'))
+plotMDS(temp, pch=19, gene.selection='common', col=cc[factor(temp$samples$time)])
+legend("toprigh", legend=levels(factor(temp$samples$time)), fill=cc, cex=1)
+
+## Trying with all concentrations 
+temp <- count_mat %>% 
+  set_rownames(make.unique(str_split(.$X, '_', simplify=T)[,1])) %>% 
+  dplyr::select(!c(contains('CsA')), -X)
+temp.f <- DGEList(counts=temp)
+temp.f <- calcNormFactors(temp.f)
+rownames(temp.f$samples)
+temp.f$samples$conc <- stringr::word(rownames(temp.f$samples), 2, sep = fixed('_'))
+png(paste0(root, '/new_visualisations/Tempo_seq_Analysis/PCA_allcounts_col_by_concentration.png'))
+plotMDS(temp.f, pch=19, gene.selection='common', col=cc[factor(temp.f$samples$conc)])
+legend("topleft", legend=levels(factor(temp.f$samples$conc)), fill=cc, cex=1)
+```
+
+
+```{r Finding common DEG gene list}
+# Finding common DEG 
+deg <- readRDS(paste0(root, '/new_SCE_objects/FINAL_WORKFLOW/deg_cellthr2.rds'))
+DEG <- readRDS(paste0(root, '/new_SCE_objects/FINAL_WORKFLOW/Tempo_seq_analysis/DEG_cisplatin_10uM.rds'))
+
+## Filter out genes with 
+## Filter with logFC2 of 2 for bulk and 1 for single cell 
+DEG.f <- DEG %>% dplyr::filter(abs(log2FC)>1) %>% dplyr::rename(gene_name=GeneSymbol_HUMAN)
+length(unique(DEG.f$gene_name)) # 4505 genes
+deg.f <- deg %>% dplyr::filter(abs(log2FC) > 1) %>% dplyr::rename(gene_name=gene)
+length(unique(deg.f$gene_name)) # 1806 genes
+
+## get gene annotations
+ah <- AnnotationHub::AnnotationHub()
+edb <- ah[["AH83216"]]
+annotations <- ensembldb::genes(edb, return.type="data.frame")  %>% dplyr::select(gene_id, gene_name, gene_biotype, description, symbol)
+
+## common genes 
+common <- intersect(deg.f$gene_name, DEG.f$gene_name)
+length(unique(common)) # 446
+DEG.f <- DEG.f %>% dplyr::filter(gene_name %in% common) %>%
+  left_join(., annotations, by='gene_name')
+deg.f <- deg.f %>% dplyr::filter(gene_name %in% common) %>%
+  left_join(., annotations, by='gene_name')
+write.csv(deg.f,paste0(root, '/new_tables/FINAL_WORKFLOW/Tempo_seq_analysis/sc_DEG_common.csv') )
+write.csv(DEG.f,paste0(root, '/new_tables/FINAL_WORKFLOW/Tempo_seq_analysis/bulk_DEG_common.csv') )
+
+## write to csv
+common.gene.anno <- annotations %>% dplyr::filter(gene_name %in% common)
+write.csv(common.gene.anno, paste0(root, '/new_tables/FINAL_WORKFLOW/Tempo_seq_analysis/common_DEG_with_thresholds_list.csv'))
+```
+
+```{r}
+# Volcano plot for each timepoint
+# TO DO:: CHANGE TO PADJ VALUE<- WHY ARE THERE NA 
+p <- ggplot(DEG, aes(pmin(log2FC,10), pmin(-log10(pvalue), 10))) + geom_point(aes(color = padj < 
+    0.05)) + geom_point(data = top_markers, color = "deeppink") + facet_wrap(~TIME, ncol=3) +
+    geom_text_repel(data=top_markers, mapping=aes(label=GeneSymbol_HUMAN)) + 
+    facet_wrap(~TIME, ncol=3) +  theme(legend.position = 'bottom') +
+    geom_vline(xintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+    geom_hline(yintercept=0, linetype='dashed', colour='#777777', size=0.2) 
+ggsave(paste0(root, '/new_visualisations/Tempo_seq_Analysis/volcano.png'))
+```
+
+```{r}
+# geometric mean of top genes
+g.means <- lapply(mat, function(x){sctransform:::row_gmean(as.matrix(x[rownames(x) %in% top_markers$GeneSymbol_HUMAN,]))}) %>% do.call(cbind, .)
+
+# z-normalize each gene seprately for treated and control
+sel <- grepl('NaCl', colnames(g.means))
+g.means[,sel] <- t(scale(t(g.means[,sel])))
+sel <- grepl('Cisplatin', colnames(g.means))
+g.means[,sel] <- t(scale(t(g.means[,sel])))
+
+# order genes by in max order 
+mat <- g.means[order(apply(g.means, 1, which.max)), ]
+p1 <- melt(mat, varnames = c("gene", "sample")) %>% mutate(sample = factor(sample)) %>% 
+    ggplot(aes(gene, factor(sample, levels = rev(c('Cisplatin_8_h', 'NaCl_8_h','Cisplatin_24_h','NaCl_24_h','Cisplatin_72_h', 'NaCl_72_h'))) , fill = value)) + 
+    geom_tile(colour = "gray66") + scale_fill_gradient2(low = "#56B4E9", mid = "white", 
+    high = "#CD5C5C", name = "Geometric mean of each gene per timepoint, scaled per gene") + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) + labs(x = NULL, 
+    y = NULL) + scale_x_discrete(expand = c(0, 0)) + scale_y_discrete(expand = c(0,0)) + 
+    theme(legend.position = "top", axis.ticks = element_blank())
+ggsave(paste0(root, '/new_visualisations/Tempo_seq_Analysis/tempo_seq_heatmap.png'))
+
+```
+
+
+```{r}
+filename <- '/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_3_Cisplatin_080721/Secondary_analysis/tables/tempo_seq_DEG.csv'
+write.csv(DEG, filename)
+```
+
+## Workflow 6 common Genes 
+
+```{r}
+de_res <- readRDS(paste0(root, '/new_SCE_objects/STEP5_Differential_Expression/Workflow_6/time_vs_rest.rds'))
+```
+
+
+

@@ -1,0 +1,898 @@
+---
+title: "Limit of Detection scRNA Analysis"
+output: html_notebook
+---
+```{r Packages}
+library(SingleCellExperiment)
+library(dplyr)
+library(readxl)
+library(scran)
+library(scater)
+library(Seurat)
+library(magrittr)
+library(BiocGenerics)
+library(AnnotationHub)
+library(EnsDb.Hsapiens.v86)
+library(DESeq2)
+library(edgeR)
+library(Seurat)
+library(forcats)
+library(ggplot2)
+library(reshape2)
+library(ggrepel)
+
+top_cumprop <- function(x, chosen) {
+    out <- perCellQCMetrics(x, percent_top=chosen, flatten=FALSE)
+    out$percent_top
+}
+
+# Apply same theme to all graphs
+theme_set(theme_classic()) 
+theme_update(text = element_text(size=12),
+panel.grid.major = element_blank(),
+panel.grid.minor = element_blank(),
+strip.background = element_blank()
+)
+
+themes <-theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  panel.background=element_rect(colour='black')
+  )
+```
+
+```{r ignore Create panel of sequencing QC}
+
+# path to images 
+
+title <- cowplot::ggdraw() + cowplot::draw_label('Analysing Drop-out Events')
+log.p1<-cowplot::ggdraw(log_reg)
+genes.p2 <- cowplot::ggdraw(genes)
+heat.p3 <- cowplot::ggdraw(heat_func)
+
+# genes per replciate and false negative rate curve
+comb <- cowplot::plot_grid(genes.p2, log.p1, nrow=1, ncol=2, rel_widths=c(0.5,1))
+cowplot::plot_grid(comb, heat.p3, NULL, ncol=2, nrow=1, rel_heights=c(0.2,1), rel_widths=c(0.2,1))
+
+ggsave('heatmap.png', heat.p3, height=20, width=10)
+ggsave('avg_exp_1vs_100.png', avg.exp.plot)
+
+# heatmap of expression and average expression
+ggsave('genes_FN_curve.png', comb, width=20, height=10)
+
+ggsave(filename = 'test.png', test1)
+cowplot::plot_grid(legend_L)
+# Combined Plot - Evaluating Clustering ---- CAREFUL OF LEGEND
+cowplot::plot_grid(title, combined, legend_L, nrow=3, rel_heights=c(0.1,1, 0.1))
+getwd()
+```
+
+
+Create SingleCellExperiment Object from UMI Matrix. 
+
+```{r Loading data as SingleCellExperiment Object}
+# Load counts matrix
+sce_mat <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_LimitOfDetection_160421/Primary_Data/ExpressionmatrixLOD_168602.csv')
+tempo_seq <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Bulk_Data_tempoSeq/tempo_seq_full_matrix.csv')
+cell_metrics <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_LimitOfDetection_160421/Primary_Data/cell_metrics.csv')
+
+# R2 reads 
+index_reads <- c('X1cell_S8_49', 
+    'X1cell_S8_50','X1cell_S8_51','X2cells_S7_61','X3cells_S6_74','X20cells_S3_14','X50cells_S2_2')
+
+# Filter R2 reads
+sce_df <- sce_mat[, !(colnames(sce_mat) %in% index_reads)] %>% 
+  dplyr::select(-c(gene.id, gene, strand, chrom, loc.5., loc.3.)) 
+samples <- factor(str_extract(colnames(sce_df), '\\d+cell'))
+
+# Single Cell Experiment object
+sce_lod <- SingleCellExperiment(list(counts=as.matrix(sce_df)), 
+  rowData=DataFrame(chrom=sce_mat$chrom, 
+  strand=sce_mat$strand,
+  symbol=sce_mat$gene,
+  loc5=sce_mat$loc.5.,
+  loc3=sce_mat$loc.3., 
+  length=abs(sce_mat$loc.5. - sce_mat$loc.3.)),
+  colData=DataFrame(sample=samples),
+  metadata=list(study='LimitOfDetectionAssay',
+  cells='Human RPTEC',
+  description='To determine the limit of detection of UPX3transcriptomicKit'))
+
+# Make sure 1:1 mapping of ensID : Gene Symbols                                            
+rownames(sce_lod) <- sce_mat$gene.id
+rownames(sce_lod) <- uniquifyFeatureNames(rownames(sce_lod), rowData(sce_lod)$symbol)
+
+# strand column otherwise causes error in downstream processing
+mcols(sce_lod) <- as.data.frame(mcols(sce_lod)) %>% dplyr::select(-strand) 
+mcols(sce_lod) <- (mcols(sce_lod))
+
+```
+
+Dunn test to compare statistical difference in gene counts between groups
+
+```{r cell metrics stat test between Genes}
+## No significant differences ??
+cell_metrics_df <- as.data.frame(cell_metrics)
+sample_type <- str_split(cell_metrics_df$Cells, simplify = T, '_')[,1]
+cell_metrics_df$sample_type <- sample_type
+
+dunn_test <- capture.output(dunn.test::dunn.test(cell_metrics_df$detected.genes, cell_metrics_df$sample_type, method='bonferroni'))
+write.csv(dunn_test, 'dunn_test_run1_samples.csv') 
+```
+
+QC plots to assess sensitivity 
+
+```{r barplot of genes detected and transcripts}
+### get metrics 
+umis_per_cell <- Matrix::colSums(counts(sce_lod))
+genes_per_cell <- Matrix::colSums(counts(sce_lod) > 0)
+umis_per_gene_cell <- umis_per_cell/genes_per_cell
+umis_per_gene <- Matrix::rowSums(counts(sce_lod))
+
+## barplot umis per cell 
+root <- '/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_LimitOfDetection_160421/Secondary_Analysis'
+sce_lod$sample <- factor(sce_lod$sample, levels=c('1cell','2cell','3cell','5cell','10cell', '20cell', '50cell','100cell'))
+png(paste0(root, '/Graphs/umis_per_per_cell.png'))
+barplot(umis_per_cell, col=cc[sce_lod$sample], border=cc[sce_lod$sample], main='Transcripts (UMIs) per cell', xaxt='n')
+legend('topleft', fill=cc, legend=levels(sce_lod$sample), cex=1, ncol=2)
+
+## barplot genes per cell 
+png(paste0(root, '/Graphs/genes_per_per_cell.png'))
+barplot(genes_per_cell, col=cc[sce_lod$sample], border=cc[sce_lod$sample], main='Genes per cell', xaxt='n')
+legend('topleft', fill=cc, legend=levels(sce_lod$sample), cex=1, ncol=2)
+
+## barploy umis per cell/genes per cell
+png(paste0(root, '/Graphs/umis_genes_per_cell.png'))
+barplot(umis_per_gene_cell, col=cc[sce_lod$sample], border=cc[sce_lod$sample], main='Transcripts (UMIs) / genes', xaxt='n')
+legend('topleft', fill=cc, legend=levels(sce_lod$sample), cex=1, ncol=2)
+```
+
+Rough check of Highly variable genes (shouldnt really be normalizing over the different groups as a whole as they have very different sequencing depths). Still good to get a rough idea of what are the most variable genes across groups. 
+
+```{r}
+## Normalization 
+s <- CreateSeuratObject(counts(sce_lod))
+s <- SCTransform(s)
+top_hvg <- HVFInfo(s) %>% 
+  mutate(., bc = rownames(.)) %>% 
+  arrange(desc(residual_variance)) %>% 
+  top_n(1000, residual_variance)  %>% 
+  rename(gene_name=bc) %>%
+  left_join(., annotations, by='gene_name')
+DefaultAssay(s) <- 'SCT'
+top_100 <- top_hvg %>% top_n(50, residual_variance) %>% pull(gene_name)
+s <- GetResidual(s, features=top_100, verbose=F)
+s$sample <- sce_lod$sample
+DoHeatmap(s, features=top_100, slot = "scale.data", group.by = 'sample') + 
+  scale_fill_gradient2(low = "#56B4E9", mid = "white", high = "#FF2800") 
+ggsave(paste0(root, '/Graphs/heatmap_hvg.png'))
+write.csv(top_hvg, paste0(root, '/tables/HVG_log.csv'))
+```
+
+Comparing genes between bulk microarray data and scRNAseq LOD 
+
+```{r updated:: Genes detected, sensitivity compared to temposeq bulk data }
+# combine with temposeq negative control data 
+temp.df <- as.data.frame(counts(sce_tempo)) %>% rowMeans(.) %>% as.matrix(.)
+rownames(temp.df) <- rowData(sce_tempo)$gene
+temp.df <- as.data.frame(temp.df) %>% tibble::rownames_to_column(var='gene')
+colnames(temp.df) <- c('gene', 'Bulk')
+
+
+# combining temposeq and sc
+sc.df <- as.data.frame(counts(sce_lod)) %>% mutate(gene=rowData(sce_lod)$symbol)
+bulk.sc.merge <- as.matrix(merge(temp.df, sc.df, by='gene', all=T))[,2:26] # 22286 total genes
+bulk.sc.merge <- apply(bulk.sc.merge, 2, as.numeric)
+bulk.sc.merge[is.na(bulk.sc.merge)] <- 0
+bulk.sc.sce <- SingleCellExperiment(list(counts=bulk.sc.merge),colData=DataFrame(sample=c(rep('bulk RNAseq', 1), str_extract(sce_lod$sample, '\\d+'))))
+
+# order values for plotting  
+ordered <- as.numeric(colnames(bulk.sc.merge)) %>% order(.) # order for plotting
+genes_per_rep <- Matrix::colSums(counts(bulk.sc.sce)> 0)
+
+
+# barplot comparing genes in temposeq and genes in sensitivity tett
+png('bulk_vs_sc_counts.png')
+ordered <- as.numeric(str_extract(bulk.sc.sce$sample, '\\d+')) %>% order(.) # order for plotting
+ # order for plotting
+barplot(genes_per_rep[ordered], col=cc[factor(bulk.sc.sce$sample)[ordered]], main="Genes per  Replicate", xaxt='n') 
+legend("topleft", legend=levels(factor(bulk.sc.sce$sample)[ordered]), fill=cc, cex=1, ncol=3)
+
+
+```
+
+scRNAseq introduces significant variability between replicates. The variability decreases at larger cell numbers
+
+```{r Replicate plot}
+
+## TO DO SAVE PLOTS
+count_df <- as.data.frame(counts(sce_lod)) %>% tibble::rownames_to_column(var='Gene') 
+
+# replicate plot for 1 cell
+p1 <- ggplot(count_df) + geom_point(aes(x=count_df$X1cell_S8_85, y=count_df$X1cell_S8_86), size=0.6, alpha=0.6, colour='#E41A1C') + labs(x='\nReplicate 1', y='Replicate 2\n') + themes
+p2 <- ggplot(count_df) + geom_point(aes(x=count_df$X1cell_S8_85, y=count_df$X1cell_S8_87), size=0.6, alpha=0.6, colour='#377EB8') + labs(x='\nReplicate 1', y='Replicate 3\n') + themes
+p3 <- ggplot(count_df) + geom_point(aes(x=count_df$X1cell_S8_86, y=count_df$X1cell_S8_87), size=0.6, alpha=0.6, colour='#4DAF4A') + labs(x='\nReplicate 2', y='Replicate 3\n') + themes
+rep_var1 <- cowplot::plot_grid(p1, p2, p3, ncol = 3)
+
+# replicate plot for 100 cells
+p100 <- ggplot(count_df) + geom_point(aes(x=count_df$X100cells_S1_1, y=count_df$X100cells_S1_2), size=0.6, alpha=0.6, colour='#E41A1C') + labs(x='\nReplicate 1', y='Replicate 2\n') + themes
+p200 <- ggplot(count_df) + geom_point(aes(x=count_df$X100cells_S1_1, y=count_df$X100cells_S1_3), size=0.6, alpha=0.6, colour='#377EB8') + labs(x='\nReplicate 1', y='Replicate 3\n') + themes
+p300 <- ggplot(count_df) + geom_point(aes(x=count_df$X100cells_S1_2, y=count_df$X100cells_S1_3), size=0.6, alpha=0.6, colour='#4DAF4A') + labs(x='\nReplicate 2', y='Replicate 3\n') + themes
+rep_var100 <- cowplot::plot_grid(p100, p200, p300, ncol = 3)
+comp_1_100 <- cowplot::plot_grid(rep_var, rep_var100, ncol=1, nrow=2)
+
+ggsave(comp_1_100, filename='replicate_noise.png')
+```
+
+
+Proportion of Mitochondrial Genes is a good metric for low quality libraries e.g. mitochondrial gene expression indicative of apoptosis. Additionally, it is harder for mtRNA to be lost from a cell than mRNA as mtRNA is contained.
+
+```{r QC - Proportion of Mitochondrial Genes per Sample}
+
+# One Gene removed
+sce_lod <- sce_lod[rowSums(counts(sce_lod) > 0) > 0,] # RNU6-308P removed
+
+# Format Cell Identities
+sce_lod$sample <- stringr::str_extract(sce_lod$sample, pattern='[0-9]+')
+
+# Create Seurat Obj
+seurat.obj <- CreateSeuratObject(counts=counts(sce_lod), project = 'Limit of Detection', meta.data = as.data.frame(colData(sce_lod)))
+Idents(seurat.obj) <- seurat.obj@meta.data$sample
+
+
+# UMI Proportion of Mitochondrial Counts
+seurat.obj <- PercentageFeatureSet(seurat.obj, '^RP', col.name='Ribo.percent')
+seurat.obj <- PercentageFeatureSet(seurat.obj, '^MT-', col.name = 'mito.percent')
+seurat.obj$mito <- seurat.obj@meta.data$mito.percent / 100
+
+
+# Mito proportion plot 
+mito.ratio.gg <- FeatureScatter(seurat.obj, feature2 = 'mito', feature1 = 'nCount_RNA', pt.size = 3, plot.cor=F) +
+  scale_x_continuous('\nTotal UMI Counts', breaks=c(10000, 50000, 100000, 140000), labels=scales::comma) +
+  labs(y='Proportion of Mitochondrial Transcripts\n', colour='Cells per Sample:') +
+  geom_hline(yintercept=0.20, linetype='dashed' ) +
+  theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  legend.position = 'bottom',
+  ) +
+  guides(col=guide_legend(ncol=3)) 
+min(seurat.obj$nFeature_RNA)
+ggsave(mito.ratio.gg, filename='QC/Mito_prop.png')
+
+
+## genes vs UMIs
+FeatureScatter(seurat.obj, feature2 = 'nFeature_RNA', feature1 = 'nCount_RNA', pt.size = 2, plot.cor=F) +
+  scale_x_continuous('\nTotal UMI Counts', breaks=c(10000, 50000, 100000, 140000), labels=scales::comma)  +
+  geom_hline(yintercept=500, linetype='dashed' ) +
+  theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  legend.position = 'bottom',
+  ) +
+  guides(col=guide_legend(ncol=3)) 
+seurat.obj$
+
+```
+
+
+Assess if rRNA depletion was successful by the % of rRNA reads 
+Compare rRNA and mtRNA counts
+
+```{r mtRNA & rRNA count table}
+
+## Do Graph of mitochrondial Genes Detected and Ribosomal Genes Detected 
+get_ribo_gene_count <- function(sample_number){
+  tmp <- rownames(split.sample[[sample_number]]@assays$RNA)[rowSums(split.sample[[sample_number]][['RNA']]@counts > 0) >0]
+  ribo.genes <- sum(grepl('^RP', tmp))
+}
+get_mito_gene_counts <- function(sample_number){
+  tmp <- rownames(split.sample[[sample_number]]@assays$RNA)[rowSums(split.sample[[sample_number]][['RNA']]@counts > 0) >0]
+  mito.genes <- sum(grepl('^MT-', tmp))
+}
+
+# Ribosomal RNA gene count 
+ribo_count <- lapply(c('1','2','3','5','10', '20','50','100'), get_ribo_gene_count)
+names(ribo_count) <- c('1','2','3','5','10', '20','50','100')
+# Mito gene count 
+mito_count <- lapply(c('1','2','3','5','10', '20','50','100'), get_mito_gene_counts)
+names(mito_count) <- c('1','2','3','5','10', '20','50','100')
+# Table of combined mito & rio reads 
+mito.ribo.genes <- rbind(mito_count, ribo_count)
+knitr::kable(mito.ribo.genes)
+
+```
+
+For each library assess the % attributed to the most abundant Genes detected across samples; a measure of the 'complexity' of libraries. Are just a few genes expressed at high numbers or do the UMI counts include high expression across a variety of genes. 
+
+```{r Feature percentage of top 500 genes}
+
+# Get Proportion of library size due to top 500 abundant genes
+colour_by_out <- retrieveCellInfo(sce_lod, I(sce_lod$sample), exprs_values = 'counts')
+colour_by_vals <- colour_by_out$val
+exprs_mat <- assay(sce_lod, i = 'counts', withDimnames=FALSE)
+to_plot <- seq_len(500)
+ncells <- ncol(exprs_mat)
+seq_real_estate <- top_cumprop(sce_lod, 500)
+seq_real_estate_long <- data.frame(Feature=rep(500, each=ncells), Cell=rep(seq_len(ncells), 500))
+seq_real_estate_long$Proportion_Library <- as.vector(seq_real_estate)
+seq_real_estate_long$sample <- rep(colour_by_vals, 500)
+
+# Proportion of library attributed to top 500 most abundant genes 
+top500 <- seq_real_estate_long %>% 
+  dplyr::filter(Feature==500) %>% 
+  transmute(sample=as.integer(sample), Proportion_Library) %>%
+  group_by(sample)  %>% 
+  merge(., df_genes) %>% 
+  arrange(as.integer(sample)) 
+
+# Bar plot of Genes vs Samples, gradient coloured by % of top 500 abundant Genes 
+cum.prop.top500 <- ggplot(top500, aes(factor(sample), mean,fill=I(mean_prop))) +
+  geom_bar(stat="identity", position=position_dodge()) + 
+  geom_errorbar(aes(ymin=mean-(sds/sqrt(3)), ymax=mean+(sds/sqrt(3))), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_gradient(low='#9ec2ff', high='#03108c') +
+  labs(x='\nCells per Sample Group', y="Average Genes Detected\n", fill='Cumulative % of Top500 Abundant Genes') +
+  theme(
+  legend.position = 'bottom',
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  panel.background=element_rect(colour='black')
+  ) +
+  guides(col=guide_legend(col='Cumulative % of Top500 Abundant Genes')) 
+ggsave(cum.prop.top500, filename='QC/cumprop_grey.png')
+
+  
+```
+
+Ignore: Assuming there are 30,000 Genes in Genome, what percentage of whole Genome was detected
+
+```{r ~Transcriptome Coverage TO DO:: REMOVE}
+
+## Calculate coverage 
+agg_sce <- aggregateAcrossCells(sce_lod, sce_lod$sample)
+coverage_df <- as.data.frame(counts(agg_sce)) %>% 
+  mutate(coverage1 = 100*((counts(agg_sce)[,'1'] * rowData(agg_sce)$length)/3200000000), 
+            coverage2 = 100*((counts(agg_sce)[,'2'] * rowData(agg_sce)$length)/3200000000), 
+            coverage3 = 100*((counts(agg_sce)[,'3'] * rowData(agg_sce)$length)/3200000000),
+            coverage5 = 100*((counts(agg_sce)[,'5'] * rowData(agg_sce)$length)/3200000000),
+            coverage10 = 100*((counts(agg_sce)[,'10'] * rowData(agg_sce)$length)/3200000000),
+            coverage20 = 100*((counts(agg_sce)[,'20'] * rowData(agg_sce)$length)/3200000000),
+            coverage50 = 100*((counts(agg_sce)[,'50'] * rowData(agg_sce)$length)/3200000000),
+            coverage100 = 100*((counts(agg_sce)[,'100'] * rowData(agg_sce)$length)/3200000000),
+            ) 
+coverage_df
+
+## Plotting coverage function ### FIX FILTER THING
+coverage_func <- function(index, coverage_df){
+  print(paste(index))
+  col2 <- paste0('coverage', index)
+  col1 <- index
+  temp_df <- coverage_df[, c(col1, col2)]
+  temp_df %>%
+  dplyr::filter(index > 0) %>%
+  ggplot() +
+  geom_point(aes_string(temp_df[[1]], temp_df[[2]], alpha=0.1))+
+  labs(x=col1, y=col2, title=paste('cell', index)) +
+  scale_x_log10()
+}
+
+coverage_df[[1]] > 0
+plist <- purrr::map(c(1, 100), coverage_func, coverage_df=coverage_df)
+
+genes <-  rowSums(counts(sce_lod)) 
+top500 <- sort(genes, decreasing = T)[1:20]
+
+## Plot of Transcript coverage of Genome
+cell1_cov <- coverage_df %>% 
+  ggplot(., aes(x=coverage_df[[1]], y=coverage100)) +
+  geom_point() +
+  geom_jitter(width=0.25) +
+  labs(x='\nAggregate Gene Count across Replicate', y='% Transcript Coverage of Genome\n')
+
+cell100_cov <- coverage_df %>% 
+  ggplot(., aes(x=coverage_df[[3]], y=coverage100)) +
+  geom_point() +
+  geom_jitter(width=0.25) +
+  labs(x='\nAggregate Gene Count across Replicates', y='% Transcript Coverage of Genome\n')
+
+cell1.vs.100 <- cowplot::plot_grid(cell1_cov, cell100_cov)
+
+
+# Coverage plot for all cellsl
+library('gridExtra')
+gg.transcriptome.cov <- do.call("grid.arrange", c(plist, nrow=4, ncol=2))
+ggsave(cell1.vs.100, filename='QC/transcriptome_cov.png')
+
+
+```
+
+Assess sensitivity of sequencing looking at number of detected Genes with different amounts of starting material
+
+```{r Total Number of Detected genes}
+## TO DO
+percentage.genome <- seurat.obj@meta.data$nCount_RNA/30000
+percent.genome.cov <- data.frame(percentage.genome, sample=as.integer(seurat.obj@meta.data$sample)) %>% group_by(sample) %>% summarise(mean_percent=mean(percentage.genome), sds=sd(percentage.genome)) %>% 
+  arrange(sample) %>%
+  ggplot(., aes(factor(sample), mean_percent)) +
+  geom_bar(stat='identity', fill='#fada5e') +
+  labs(x='\nCells per Sample', y='% Genome Coverage\n') +
+  geom_errorbar(aes(ymin=mean_percent-sds/sqrt(3), ymax=mean_percent+sds/sqrt(3)), width=.2, position=position_dodge(.9))
+ggsave(percent.genome.cov, filename='QC/pecent_genome.png')
+# Detected Genes
+detectedgenes <- colSums(counts(sce_lod) > 0) 
+names(detectedgenes) <- stringr::str_extract(names(detectedgenes), pattern='[0-9]+')
+
+# Gene counts
+df_genes <- data.frame(total_genes=detectedgenes, sample=as.integer(names(detectedgenes))) %>% 
+  group_by(sample) %>% 
+  summarise(mean=mean(total_genes), sds=sd(total_genes)) %>% 
+  arrange(as.integer(sample))
+
+# gg of gene counts
+detectedGenes_gg <- ggplot(df_genes, aes(factor(sample), mean)) +
+  geom_bar(stat="identity", fill="#b5e2ff", colour='black',position=position_dodge()) +
+  geom_errorbar(aes(ymin=mean-sds/sqrt(3), ymax=mean+sds/sqrt(3)), width=.2,
+                 position=position_dodge(.9)) +
+  labs(x='\nCells per Sample Group', y='Average Genes Detected\n')
+ggsave(detectedGenes_gg, filename='QC/detectedgenes.png')
+
+
+```
+
+How does sequencing depth change as amount of starting material changes?
+
+```{r Total Reads}
+
+# reads 
+df_reads <- data.frame(reads =seurat.obj@meta.data$nCount_RNA, sample=as.integer(seurat.obj@meta.data$sample)) %>% 
+  group_by(sample) %>% 
+  summarise(mean=mean(reads), sds=sd(reads)) %>% 
+  arrange(as.integer(sample))
+
+dim(df_reads)
+# gg of reads
+reads_gg <- ggplot(df_reads, aes(factor(sample), mean,  fill='coral')) +
+  geom_bar(stat="identity", color="black", position=position_dodge()) +
+  geom_errorbar(aes(ymin=mean-sds/sqrt(3), ymax=mean+sds/sqrt(3)), width=.2,
+                 position=position_dodge(.9)) +
+  labs(x='\nNumber of Cells', y='Mean UMI counts\n') + NoLegend()
+
+## Gene vs Reads Scatter
+genes.reads.scatter <- FeatureScatter(seurat.obj, feature2 = 'nFeature_RNA', feature1 = 'nCount_RNA', pt.size = 2, plot.cor=F) +
+  scale_x_continuous('\nTotal UMI Counts', breaks=c(10000, 50000, 100000, 140000), labels=scales::comma) +
+  labs(y='Detected Genes\n', colour='Cells per Sample') +
+  theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  panel.background=element_rect(colour='black')
+  )
+
+ggsave(reads_gg, filename='QC/reads.png')
+ggsave(genes.reads.scatter, filename='QC/reads_vs_genes.png')
+```
+
+Heatmap of genes with highest expression. 
+
+```{r plot highest expression} 
+
+# adapted source code 
+exprs_mat <- assay(sce_lod, 'counts', withDimnames = F)
+
+# avg expression
+avg_exp <- rowSums2(exprs_mat)
+
+# orders from largest to smallest and returns indexes 
+oo <- order(avg_exp, decreasing=T)
+chosen <- head(oo, 50)
+sub_mat <- exprs_mat[chosen,,drop=F]
+sub_avg <- avg_exp[chosen]
+
+
+# calculate expresson values 
+total_exp <- sum(avg_exp)
+top_pct <- 100 * sum(sub_avg)/total_exp # percentage of counts of top 50/ total counts -> for plotting title
+
+# Divide each row in subsetted matrix by total expression for each sample
+sub_mat <- 100 * sweep(sub_mat, 2, colSums2(exprs_mat), "/", check.margin=FALSE)
+colnames(sub_mat)  <- str_split(colnames(sub_mat), '_|X', simplify = T)[,2]
+
+
+# names for plotting
+gene_names <- rownames(sce_lod)[chosen]
+ordered_gene_names <- factor(gene_names, rev(gene_names)) # order so most highly expressed is last 
+rownames(sub_mat) <- ordered_gene_names
+
+# plot dendrogram or not???
+heat_func <- function(){
+  heat.top <- heatmap(sub_mat, scale='column', ColSideColors= cc[sce_lod$sample], Rowv = NA, Colv = NA,
+        main=' % of counts from top 50 genes' )
+}
+
+  
+```
+
+
+
+
+Normalize across replicates (not samples) using seurat, regressing out sequencing depth, mitochondrial %, and ribo %
+Find top highly variable Genes in each sample
+
+```{r Seurat normalization}
+
+
+# Split samples to do normalization on each sample separately
+split.sample <- SplitObject(seurat.obj, split.by='ident')
+split.sample <- lapply(split.sample, SCTransform, min_cells=1, method='glmGamPoi', 
+    vars.to.regress=c('mito.percent', 'nCount_RNA', 'Ribo.percent'),  return.only.var.genes = F)
+
+DefaultAssay(seurat.obj) <- "RNA"
+
+### Plot highly variable Genes for each sample
+## 100 cells & 50 cells
+var_genes <- FindVariableFeatures(split.sample[[8]], selection.method = 'vst', nfeatures=2000)
+top20 <- head(VariableFeatures(var_genes), 20)
+plot1 <- VariableFeaturePlot(var_genes)
+plot2 <- LabelPoints(plot = plot1, points = top20, repel = TRUE, xnudge = 0, ynudge = 0, max.overlaps=Inf) + NoLegend() +
+    labs(x='Geometric Mean Expression', y='Residual Variance', title=paste0(100, ' cells'))
+ggsave(plot2, filename='QC/variable_gene_100.png')
+ggsave(plot2, filename='QC/variable_gene_50.png')
+cell_100_1_gg <- cowplot::plot_grid(plot1,plot2)
+ggsave(cell_100_1_gg, filename='QC/cell_100_1_gg.png')
+
+##  Top 20 Genes between samples 
+top20_commmon <- function(sample_number){
+  var_genes <- FindVariableFeatures(split.sample[[sample_number]], selection.method = 'vst', nfeatures=2000)
+  top20 <- head(VariableFeatures(var_genes), 20)
+}
+
+# See if there are any common genes across all samples
+hvg_20_list <- lapply(c('1','2','3','5','10', '20','50','100'), top20_commmon)
+unlist(hvg_20_list)[duplicated(unlist(hvg_20_list), use.names=F)]
+
+# All Samples; highly variable genes labelled with top 20 Genes 
+variable_gene_plot <- function(sample_number){
+  var_genes <- FindVariableFeatures(split.sample[[sample_number]], selection.method = 'vst', nfeatures=2000)
+  top20 <- head(VariableFeatures(var_genes), 20)
+  gg <- VariableFeaturePlot(var_genes) 
+  LabelPoints(gg, points = top20, repel = TRUE, xnudge = 0, ynudge = 0, max.overlaps=Inf, force=10) + NoLegend() +
+  labs(x='Geometric Mean Expression', y='Residual Variance', title=paste0(sample_number, ' cells'))
+}
+variable_gg_list <- lapply(c('1','2','3','5','10', '20','50','100'), variable_gene_plot)
+gg.variable.plot <- do.call("grid.arrange", c(variable_gg_list, nrow=4, ncol=2))
+
+## Save 2x images so easier to view
+gg_1 <- cowplot::plot_grid(variable_gg_list[[1]] + themes, variable_gg_list[[2]] +themes) 
+
+gg_2 <- cowplot::plot_grid(variable_gg_list[[3]]+themes, variable_gg_list[[4]]+themes)
+gg_3 <- cowplot::plot_grid(variable_gg_list[[5]]+themes, variable_gg_list[[6]]+themes)
+gg_4 <- cowplot::plot_grid(variable_gg_list[[7]]+themes, variable_gg_list[[8]]+themes)
+ggsave(gg_1, filename='QC/variable_gene_1_2.png')
+ggsave(gg_2, filename='QC/variable_gene_3_5.png')
+ggsave(gg_3, filename='QC/variable_gene_10_20.png')
+ggsave(gg_4, filename='QC/variable_gene_50_100_.png')
+
+
+```
+
+```{r Aggregate Expression (not used)}
+
+# Plot Aggregate Expression for 1 cell and 100 cell
+# Get Expression for 1 cell
+cell.1.agg <- subset(seurat.obj, idents='1')
+cell.1.df.agg <- as.data.frame(AggregateExpression(cell.1.agg, verbose=F, slot='counts')$RNA)
+cell.1.df.agg$gene <- rownames(cell.1.df.agg)
+colnames(cell.1.df.agg) <- c('cell1', 'Gene')
+
+# Get Expression for 100 cell 
+cell.100.agg <- subset(seurat.obj, idents=c('100','1'))
+cell.100.df.agg <- as.data.frame(AggregateExpression(cell.100.agg, verbose=F, slot='counts')$RNA)
+cell.100.df.agg$gene <- rownames(cell.100.df.agg)
+colnames(cell.100.df.agg) <- c('cell100', 'Gene')
+
+```
+
+Compare sequencing depth in 1 vs 100 cells, via average expression of Genes 
+
+```{r Avg Expression of 1 cell vs 100 cells plot }
+
+# Plot Average Expression of 1cell and 100cells
+cell.100 <- subset(seurat.obj, idents=c('1','100'))
+cell.100.df <- as.data.frame(log1p(AverageExpression(cell.100, verbose=F)$RNA))
+cell.100.df$gene <- rownames(cell.100.df)
+colnames(cell.100.df) <- c('cell1', 'cell100', 'Gene')
+
+
+# Labels for plotting top Genes in 100 cells & 1 cells
+label1 <- cell.100.df %>% dplyr::filter(cell1 > 40)
+label2 <- cell.100.df %>% dplyr::filter(cell100 > 450)
+labels <- rbind(label1, label2) 
+labels <- labels[!duplicated(labels),]
+
+plot(avg.exp.plot)
+# Plot Scatter
+avg.exp.plot <- cell.100.df %>%
+  ggplot(., aes(cell1, cell100, color=dplyr::case_when(cell1 >= 40 ~ '#1b9e77',
+                                cell100 >450 ~ '#d95f02', 
+                                TRUE ~ '#000000'))) +
+  geom_point() +
+  geom_text_repel(data=labels, aes(cell1, cell100, label=Gene)) +
+  labs(x='\nAverage Expression (1 cell)', y='Average Expression (100 cells)\n', title='Average Gene Expression')+ 
+  NoLegend() +
+  theme(text = element_text(),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.background = element_blank(),
+  plot.title = element_text(face = "bold", family='sans', hjust=0.5)
+  ) 
+ggsave(avg.exp.plot, filename='QC/average_exp_1_vs_100.png')
+  
+```
+
+```{r comparing replicate counts in 1 cell vs 100 cells}
+
+# replicate plot # 100 cells
+rep_1cell_pl <- as.data.frame(cell.100@assays[['RNA']]@counts) %>% ggplot(., aes(.[[2]], .[[1]])) + geom_point() + scale_x_continuous(scales::pseudo_log_trans()) + scale_y_continuous(scales::pseudo_log_trans()) + themes
+
+# replicate plot # 1 cell
+rep_100cell_pl <- as.data.frame(cell.100@assays[['RNA']]@counts) %>% ggplot(., aes(.[[5]], .[[6]])) + geom_point() + scale_x_continuous(scales::pseudo_log_trans()) + scale_y_continuous(scales::pseudo_log_trans()) + themes
+
+# combined plot
+rep_plot <- cowplot::plot_grid(rep_100cell_pl, rep_1cell_pl)
+ggsave('QC/rep_plot_1vs_100.png', rep_plot)
+
+```
+
+
+Some basic pathway analysis; Gene list of genes with count >1 for each sample passed in, to get rough estimate
+of pathways across samples.Difficult to do comparisons as difficult to integrate across samples with only 3 replicates, so there is large batch effect between groups
+
+```{r ignore : Reactome pathway plot}
+
+cell1 <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/LOD_Analysis/reactome/cell_1.csv')
+cell5 <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/LOD_Analysis/reactome/cell_5.csv')
+cell100 <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/LOD_Analysis/reactome/cell_100.csv')
+
+## Common pathways
+##df.reactome <- data.frame(percentage1=cell1$Percentage.of.Genes.found.in.pathway,
+##                          percentage5=cell5$percentage,
+##                          percentage100=cell100$Percentage,
+##                          pathway=cell1$Pathway.name) %>% 
+##                          dplyr::filter(., pathway == common.pathways) %>% 
+##                          tidyr::pivot_longer(., -pathway, names_to='sample',                                        ##     values_to='percentage')
+
+## Data frames for all 'interesting'reactom.df.1 <- data.frame(percentage.of.pathway = cell1$Percentage.of.Genes.found.in.pathway
+
+reactom.df.1 <- data.frame(percentage=cell1$Percentage.of.Genes.found.in.pathway,
+                           sample=cell1$Sample.type,
+                           pathway=cell1$Pathway.name)
+reactom.df.5 <- data.frame(percentage=cell5$percentage, 
+                           sample=cell5$sample,
+                           pathway=cell5$Pathway.name)
+reactom.df.100 <- data.frame(percentage=cell100$Percentage,
+                            sample=cell100$sample,
+                            pathway=cell100$Pathway.name)
+
+# Format for plotting
+allrows<- Reduce(rbind, list(reactom.df.1, reactom.df.5, reactom.df.100)) %>%
+                            dplyr::filter(., pathway %in% selected_pathways)
+df.reactom <- allrows %>% tidyr::pivot_wider(., names_from=sample, 
+                            values_from=percentage)%>% melt(.) 
+
+View(df.reactom)
+gg.reactom <- df.reactom %>% 
+  ggplot(., aes(x=pathway, y=value, fill=variable)) +
+  geom_bar(stat='identity', position=position_dodge()) +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  scale_x_discrete(labels=c('SRP-co-translation', 
+                            'selenocysteine synthesis',
+                            'Amino acid defeciency',
+                            'Electron Transport',
+                            'SLITS & ROBOS Regulation',
+                            'Silencing of ceruloplasmin Expression',
+                            'Endosomal/Vacuolar',
+                            'Starvation', 
+                            'mRNA destabilisation by AUF')) +
+  labs(fill='Sample', y='% Genes in Pathway')
+
+ggsave(gg.reactom, filename='QC/reactom_pathways.png')
+
+
+## Interesting seleceted pathways, including all common 
+selected_pathways <- c('Activation of APC/C and APC/C:Cdc20 mediated degradation of mitotic 
+                        proteins', 
+                       'Cellular response to starvation',
+                       'L13a-mediated translational silencing of Ceruloplasmin expression',
+                       'AUF1 (hnRNP D0) binds and destabilizes mRNA',
+                       'Regulation of expression of SLITs and ROBOs',
+                       'Response of EIF2AK4 (GCN2) to amino acid deficiency',
+                       'SRP-dependent cotranslational protein targeting to membrane',
+                       'Endosomal/Vacuolar pathway',
+                       'Selenocysteine synthesis',
+                       'Respiratory electron transport')
+                       
+# merge all pathways together 
+df.allpathways <-merge(merge(df.all.pathways.100, df.all.pathways.5, by='pathway', all=T), 
+                      df.all.pathways.1, by='pathway', all=T) %>% 
+                      dplyr::filter(., pathway %in% selected_pathways) %>% 
+                      replace(is.na(.), 0) %>%
+                      tidyr::pivot_wider()
+
+common.pathways <- Reduce(intersect, list(cell1$Pathway.name, cell5$Pathway.name, cell100$Pathway.name)) 
+
+```
+
+
+```{r ignore  Reactome Number of pathways Plot}
+
+read.reactome <- function(sample_group, df){
+  dir <- '/hpc/scratch/hdd2/fs541623/scRNAseq/LOD_Analysis/reactome/'
+  filename <- paste0(dir, 'cell_',sample_group,'_reactome.csv')
+  pathway.number <- nrow(read.csv(filename))
+}
+
+pathways.csv <- lapply(c(1,2,3,5,10,20,100), read.reactome) %>% unlist()
+names(pathways.csv) <- as.integer(c(1,2,3,5,10,20,100))
+
+df.pathways.num <- data.frame(pathways=pathways.csv, sample=as.integer(c(1,2,3,5,10,20,100))) %>% 
+                arrange(as.integer(sample))
+
+gg.pathways <-  ggplot(df.pathways.num, aes(factor(sample), pathways)) +
+                geom_bar(stat='identity', fill='#7851a9') +
+                labs(x='\n Cells per Sample', y='Pathways Detected\n') 
+                    
+ggsave(gg.pathways, filename='QC/pathway_number.png')
+
+
+```
+
+```{r ignore Reactome expression/For Claire to pass through IPA}
+
+## Split by normalization 
+split_df <- function(sample_group){
+  tmp <- split.sample[[sample_group]]@assays$SCT@data
+  filename <- paste0('pathway_analysis/', sample_group, '_normalized.csv')
+  write.csv(tmp, file=filename)
+}
+
+
+exp_mat_split <- lapply(c('1','2','3','5','10', '20','50','100'), split_df)
+
+## Save aggregate
+write.csv(counts(agg_sce), file='pathway_analysis/aggregate_count.csv')
+
+## Save replicate normalized, full exp matrix 
+seurat_comb <- Reduce(merge, split.sample)
+write.csv(seurat_comb@assays$SCT@data, file='pathway_analysis/normalized_counts.csv')
+
+```
+
+
+
+```{r split raw counts for Claire}
+
+## Expression matrix split by sample
+save_csv_raw <- function(sample_group){
+  tmp <- split.sample[[sample_group]]@assays$RNA@data
+  filename <- paste0('pathway_analysis/', sample_group, '_rawcounts.csv')
+  write.csv(tmp, file=filename)
+}
+
+exp_mat_split <- lapply(c('1','2','3','5','10', '20','50','100'), save_csv_raw)
+
+## Full expression matrix 
+write.csv(counts(sce_lod), file='pathway_analysis/full_raw_counts.csv')
+
+## Full normalized expression matrix 
+seurat.obj_full_transform <- SCTransform(seurat.obj)
+write.csv(seurat.obj_full_transform@assays$SCT@data, file='pathway_analysis/full_normalized_counts_.csv')
+```
+
+combine tempo and sc to model dropout rate in sc data. Logistic regression is a common method to model these dropout. Here tempo-seq was used as the ground truth. 
+Firstly I merged tempo and sc data on common gene names. For genes expressed in tempo-seq but not expressed in sc-data a 0 value was imputed. 
+
+```{r combine tempo and sc}
+
+tempo_meta <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Bulk_Data_tempoSeq/temposeq_ensembl_ids.csv')
+tempo_seq <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Bulk_Data_tempoSeq/tempo_seq_full_matrix.csv')
+sce_mat <- sce_mat[, !(colnames(sce_mat) %in% index_reads)] 
+
+# merge tempo metadata with temposeq matrix to get ensembl id
+tempo_genes <- str_extract(tempo_seq$X, '.*?(?=_)')
+temposeq_nacl <- tempo_seq[,is.na(str_extract(colnames(tempo_seq), 'NaCl')) == FALSE] %>% 
+                 mutate(Probe.Name=tempo_seq$X)
+merged_tempo <- merge(temposeq_nacl, tempo_meta, by='Probe.Name', all=T)
+
+# filter out genes not expressed 
+sce_tempo <- SingleCellExperiment(list(counts=as.matrix(merged_tempo[,2:10])), 
+                rowData=DataFrame(gene=merged_tempo$Gene.Symbol, 
+                                  ensembl=merged_tempo$ENSEMBL.Gene.ID))
+rownames(sce_tempo) <- merged_tempo$gene
+
+# filter out tempo genes with counts > 0
+sce_tempo <- sce_tempo[rowSums(counts(sce_tempo) > 0) > 0,]
+filtered_df <- as.data.frame(counts(sce_tempo)) %>% 
+               mutate(., gene=rowData(sce_tempo)$gene, 
+                         ensembl=rowData(sce_tempo)$ensembl)
+
+# merge tempo and sc on genes
+merged_sc_tempo <- merge(filtered_df, sce_mat, by='gene', all =T)
+merged_sc_tempo[is.na(merged_sc_tempo)] <- 0
+merged_sc_tempo <- merged_sc_tempo %>% dplyr::select(contains('cell'), gene, ensembl)
+
+# quick check 
+View(merged_sc_tempo)
+nrow(merged_sc_tempo)# 22286 FULL GENE LIST 
+length(tempo_genes) # 22547
+sce_mat <- sce_mat[rowSums(sce_mat > 0) > 0,]
+nrow(sce_mat) # 12889
+```
+
+logistic regression showing rate of failure for a given gene expression using tempo-seq as ground truth
+
+```{r model dropouts}
+
+# merge temposeq data and single cell 
+sce_tempo_sc <- SingleCellExperiment(list(counts=merged_sc_tempo[,1:(ncol(merged_sc_tempo)-2)]),
+                                     rowData=DataFrame((ensembl=merged_sc_tempo$ensembl),
+                                                        gene=merged_sc_tempo$gene), 
+                                     colData=DataFrame(sample=factor(colname_split)))
+mu_obs <- rowMeans(log10(counts(sce_tempo_sc)+1))
+
+
+
+# Number of dropouts
+drop_outs <- counts(sce_tempo_sc) == 0
+dim(drop_outs)[2]
+
+library(RColorBrewer)
+cc <- c(brewer.pal(9, "Set1"), brewer.pal(8, "Set2"),brewer.pal(9,"Set3"))
+cc[factor(sce_tempo_sc$sample)]
+cc
+
+
+```
+
+```{r modelling dropouts using logistic regression}
+
+png('QC/false_negative_curve.png', res=72)
+ref.glms <- list()
+for (cell in 1:dim(drop_outs)[2]){
+  fit = glm(cbind(drop_outs[,cell], 1 - drop_outs[,cell]) ~ mu_obs, family=binomial(logit))
+  ref.glms[[cell]] = fit$coefficients
+}
+
+
+
+plot(NULL, main='Modelling Gene Drop-out Events against in-house bulk RNAseq ', ylim=c(0,1), xlim=c(0,2), ylab='Failure Probability', xlab='Mean log10 Expression')
+x= (0:200)/100
+AUC=NULL
+for(cell in 1:ncol(counts(sce_tempo_sc))){
+  y = 1/(exp(-ref.glms[[cell]][1] - ref.glms[[cell]][2] * x) + 1)
+  AUC[cell] = sum(y)/10
+  lines(x, 1/(exp(-ref.glms[[cell]][1] - ref.glms[[cell]][2] * x) + 1), type='l', lwd=2, col=cc[factor(sce_tempo_sc$sample)][cell])}
+
+legend("topright", legend=str_extract(levels(factor(sce_tempo_sc$sample)), '[0-9+].*'), fill=cc, cex=1)
+
+
+
+
+
+```
+
+```{r Genes not detected in temposeq data}
+
+nrow(filtered_df) # 19456 genes in temposeq data 
+nrow(sce_lod) # 12889 genes in sc
+sc_specific_genes <- sce_lod[!(rownames(sce_lod) %in% filtered_df$gene),] # 2833 genes detected by sc not detected by tempo
+rownames(sc_specific_genes)
+
+```
+
+
+

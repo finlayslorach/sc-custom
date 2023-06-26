@@ -1,0 +1,287 @@
+---
+title: "cisplatin_tox analysis_1"
+output: html_document
+date: "25/08/21"
+author: "Finlay Slorach"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading data 
+
+This is a function that will load all packages required for the analysis. If you dont have any of these packages installed; install_packages('dplyr') for example, will install the package. Then you can load it using library('dplyr')
+
+```{r results='hide', message=FALSE, warning=FALSE}
+load_packages<- function(){library(SingleCellExperiment)
+  library(dplyr)
+  library(scran)
+  library(scater)
+  library(Seurat)
+  library(magrittr)
+  library(BiocGenerics)
+  library(AnnotationHub)
+  library(EnsDb.Hsapiens.v86)
+  library(DESeq2)
+  library(edgeR)
+  library(Seurat)
+  library(forcats)
+  library(ggplot2)
+  library(reshape2)
+  library(ggrepel)
+  library(batchelor)
+  library(stringr)
+  library(RColorBrewer)
+  library(SC3)
+  library(dendextend)
+  library(dynamicTreeCut)
+  library(limma)
+  library(SeuratWrappers)
+  library(Nebulosa)
+  library(cluster, quietly = TRUE)
+  library(harmony)
+  library(clustree)
+  library(destiny)
+  library(plotly)
+  library(org.Hs.eg.db)
+  library(edgeR)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(VennDiagram)
+}
+load_packages()
+```
+
+This is a function to retrieve human genome annotations  e.g. descriptions and type e.g. rRNA, non-coding RNA etc for all human genes
+
+```{r}
+####'GET GENOME ANNOTATIONS ####
+load_annotations <- function(){
+  ah <- AnnotationHub::AnnotationHub()
+  edb <- ah[["AH83216"]]
+  annotations <- ensembldb::genes(edb, return.type="data.frame")  %>%
+    dplyr::select(gene_id, gene_name, gene_biotype, description, symbol)
+  return(annotations)
+}
+annotations <- load_annotations()
+```
+
+## Load and format data 
+
+Firstly, load count data (genes x samples matrix). I set the root directory as well to make it easier to save images/tables etc. Also set a theme for graphs and a colour pallete used for all the graphs. 
+
+```{r}
+##### LOAD DATA #####
+X <- read.csv('/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_3_Cisplatin_080721/Secondary_analysis/Copy of UMI_matrix_150821.csv')
+root <- '/hpc/scratch/hdd2/fs541623/scRNAseq/Run1_3_Cisplatin_080721/Secondary_analysis'
+theme_set(theme_bw())
+cc <- c(brewer.pal(8, "Set2"),brewer.pal(9,"Set3"))
+head(X[,1:4])
+```
+
+Need to format data. Make sure the rownames are the Ensembl gene ids. Create a single cell experiment object as it helps accessing the data more easily. A summary about single cell experiment (SCE) can be found at [orchestrating single cell analysis rmarkdown book]: (https://bioconductor.org/books/release/OSCA/). Save the SCE object. Assign metadata to cells e.g. time, day etc and store in SCE
+
+```{r }
+######### FORMAT DATA ##########
+Y <- X %>% dplyr::select(-c(Gene, gene.id))
+rownames(Y) <- X$gene.id
+sce_3 <- SingleCellExperiment(list(counts=Y), rowData=DataFrame(symbol=X$Gene)) %>% 
+  set_rownames(uniquifyFeatureNames(rownames(.), rowData(.)$symbol))
+#saveRDS(sce_3, paste0(root, '/new_SCE_objects/FINAL_WORKFLOW/raw_sce.rds'))
+
+## get sample labels ##
+sce_3$sample <- str_extract(colnames(sce_3), '\\d+h')
+sce_3$sample[is.na(sce_3$sample)] <- '0h'
+sce_3$sample <- factor(sce_3$sample, levels=c('0h', '2h', '8h','16h','24h', '48h','72h'))
+
+## get day labels ##
+days <- str_extract(colnames(Y), '.*_day\\d+')
+days[is.na(days)] <- 'Other'
+sce_3$day <- days
+sce_3
+```
+
+## Quality control 
+
+QC to remove failed/low quality libraries as these will confound downstream analysis by introducing lots of technical noise. Exacerbating fold changes during differential expression testing and causing clusterning due to technical noise not relevant biological information. Proportion of mitochondrial (MT) counts is a good metric to store; usually a high MT is indicative of low quality libraries e.g. apoptotic processes and mtDNA enrichment (can sometimes imply loss of other RNA from the cell). rRNA also might be interesting to check if rRNA depletion was successful during library preparation.
+
+This function adds per cell QC metrics e.g. total UMI counts per cell, MT counts per cell, genes per cell, rRNA counts per cell. These are stored in the column data of the SCE object.
+
+```{r}
+########### QC #############################
+counts(sce_3) <- data.matrix(counts(sce_3))
+sce_3 <- addPerCellQC(sce_3, 
+  subsets=list(mito=grepl('^MT-', rowData(sce_3)$symbol), 
+  ribo=grepl('^RP', rowData(sce_3)$symbol)))
+head(colData(sce_3)[,1:11])
+```
+
+You can then begin to assess the QC metrics through QC plots.To change the plot supply a different column name for x or y e.g. y= 'detected' instead of 'sum' would show genes detected. log Scale the y-axis to identify the lower tail outliers. Then we discard cells based on a combination of metrics to avoid discarding relevant biological heterogeneity. (Some of these thresholds were based on previous QC experiment)
+
+```{r}
+#### QC plots ####
+p1 <- plotColData(sce_3, x="sample", y="sum") + scale_y_log10() 
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/QC_sum_logscale.png'))
+discard <- sce_3$sum < 600 | sce_3$subsets_mito_percent < 1 | sce_3$sum > 20000 | sce_3$detected < 500
+sce_3$discard <- discard
+filtered_sce_3 <-sce_3[,!(discard)]
+filtered_sce_3$lowgenes <- filtered_sce_3$detected < 500
+p2 <- plotColData(filtered_sce_3, x="sample", y="sum", colour_by = 'lowgenes') + scale_y_log10() 
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/QC_sum_logscale_afterfiltering.png'))
+cowplot::plot_grid(p1 + ggtitle('Before QC'),p2 + ggtitle('After QC'))
+```
+
+## Normalization 
+
+Normalization is necessary to correct for variability in sequencing depth caused by technical factors. It also helps give  equal weight to low and high abundance genes so that high abundance genes (which aren't usually the most interesting) dominante downstream analysis (Variance stabilization). This paper explains it well. [normalization paper]: https://www.biorxiv.org/content/biorxiv/early/2021/07/09/2021.07.07.451498.full.pdf. In summary, there are 2 methods to normalize ; using size factors to scale the gene expressions per cell, or use statistical distributions to model the data. E.g. UMI counts often follow a negative binomial distribution. The gene dispersions from the model are then estimated and technical variability 'removed'. The high % of zeros in scRNAseq causes difficulty in normalization (zero inflated data). Another approach that I havn't been able to try but looks interesting is using the package [scone]:https://www.bioconductor.org/help/course-materials/2016/BioC2016/ConcurrentWorkshops1/Risso/scone.html which compares different normalization methods and 'chooses' the most appropriate one. 
+
+In this chunk, we set the seed (SCTransform can be random so setting the seed ensures you get the same results each time). Then we have to convert between a SCE and seurat object to do the normalization etc. Seurat is also a bit more intuitive than SCE. We add MT percentage counts as 'mito.percent', define high mito counts > 20%, and normalize the data using [SCTransform]:https://satijalab.org/seurat/articles/sctransform_vignette.html. This function also identifies the top highly variable genes (often the most important). Selective the most informative genes helps reduce technical noise further , and these genes are used for principal component analysis (PCA) which is a dimensionality reduction technique. 'SCT' assay contains the normalized counts and 'RNA' assay contains the unormalized counts.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+############## NORMALIZATION ################### 
+set.seed(123)
+s <- CreateSeuratObject(counts(filtered_sce_3)) %>%
+  PercentageFeatureSet(.,pattern='MT-', col.name='mito.percent') %>%
+  AddMetaData(.$mito.percent > 20, col.name='high.mito') %>% 
+  SCTransform(., verbose=F, return.only.var.genes = F, 
+  variable.features.n = 1000)%>%
+  RunPCA(assay='SCT', features=VariableFeatures(.))
+```
+
+Write the most informative genes (HVG) to a file with their associated gene annotations
+
+```{r}
+### Write HVG to file ### 
+top_hvg <- HVFInfo(s) %>% 
+  mutate(., bc = rownames(.)) %>% 
+  arrange(desc(residual_variance)) %>% 
+  top_n(1000, residual_variance)  %>% 
+  rename(gene_name=bc) 
+hvg.anno <- annotations %>% 
+  dplyr::filter(gene_name %in% top_hvg$gene_name) %>% 
+  left_join(., top_hvg, by='gene_name') %>% 
+  arrange(desc(residual_variance))
+#write.csv(hvg.anno, paste0(root, '/new_tables/FINAL_WORKFLOW/hvglist.csv'))
+head(hvg.anno)
+```
+
+## Dimensionality reduction 
+
+Can also write PCA loadings to a file with their associated gene annotations. PCA loadings ([pca explained]:https://www.youtube.com/watch?v=FgakZw6K1QQ) are the 'scores' given by the PCA algorithm showing how much each gene contributes to the variance of a given principal component. Here we arrange PC1 and PC2 loadings from highest to lowest.
+
+```{r}
+### Write PCA loadings to file ###
+PCAloadings1 <- Loadings(s) %>% 
+  as.data.frame(.) %>% dplyr::select(PC_1, PC_2) %>% 
+  tibble::rownames_to_column(var='gene_name') %>% 
+  left_join(., annotations, by='gene_name') %>% 
+  arrange(-PC_1)
+PCAloadings2 <- Loadings(s) %>% 
+  as.data.frame(.) %>% dplyr::select(PC_1, PC_2) %>% 
+  tibble::rownames_to_column(var='gene_name') %>% 
+  left_join(., annotations, by='gene_name') %>% 
+  arrange(-PC_2)
+#write.csv(PCAloadings1, paste0(root, '/new_tables/FINAL_WORKFLOW/PC1_loading_ordered.csv'))
+#write.csv(PCAloadings2, paste0(root, '/new_tables/FINAL_WORKFLOW/PC2_loading_ordered.csv'))
+head(PCAloadings1)
+```
+
+Choosing the optimum number of principal components (PCs) to summarise the variance within the data is difficult. Horns analysis is a method which compares PCA ran on your data to PCA ran on random data and chooses the number of PCs which are contribute higher than random variation. Elbow plot is another method to assess the amount of variation explained by each principal component. The number of principal components when the graph reaches a point of inflexion is the 'optimum' PC. Here both give different results and testing results with various PC is often done. 
+
+```{r}
+############# DIM REDUCTION ###################
+horns <- PCAtools::parallelPCA(GetAssayData(s, assay='SCT', slot='scale.data')[VariableFeatures(s),])
+horns$n ## 23 
+ElbowPlot(s) + ggtitle('Elbow plot') ## 10
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/Elbow_plot.png'))
+s$sample <- filtered_sce_3$sample
+s$day <- filtered_sce_3$day
+```
+
+PCA plot using data stored in seurat object 
+
+```{r}
+########### PCA #############
+to.plot <- as.data.frame(Embeddings(s[['pca']])) %>% 
+  mutate(sample=s$sample) 
+p1 <- ggplot(to.plot) + 
+  geom_point(aes(PC_1, PC_2, color=sample), size=2, alpha=0.8)+
+  coord_fixed(1) +
+  geom_vline(xintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  geom_hline(yintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  scale_colour_manual(values=c(cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]), 
+  guide = guide_legend(override.aes = list(size = 5), title='Timepoint'))
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/PCA_plot.png'))
+```
+
+To assess day of sampling effect i.e. see if any separation is caused by day of sampling which isnt important biological heterogeneity, we ran PCA on a subset of the data and assessed if there was separation due to day fo sampling. Here PCA doesnt seem to separate the groups as well. Important to note that these are all the same cell types so there isn't much heterogeneity. If there was separation due to day of sampling (i.e. day 1 8hrs clustering) that would imply that day of sampling was confounding results. 
+
+```{r message=FALSE, warning=FALSE }
+## Run PCA on subset ##
+s.s <- subset(s, subset=day!='Other')
+s.s <- s.s %>% RunPCA() 
+to.plot <- as.data.frame(Embeddings(s.s[['pca']])) %>% 
+  mutate(day=s.s$day) 
+p2 <- ggplot(to.plot) + 
+  geom_point(aes(PC_1, PC_2, color=day), size=2)+
+  coord_fixed(1) +
+  geom_vline(xintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  geom_hline(yintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  scale_colour_manual(values=c(cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]), 
+  guide = guide_legend(override.aes = list(size = 5), title='Timepoint'))
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/PCA_plot_batcheffect.png'))
+```
+
+```{r}
+cowplot::plot_grid(p1+ggtitle('PCA'),p2+ggtitle('PCA to assess day of \n sampling variation'))
+```
+
+Multi dimensional scaling is another linear dimensionality reduction technique like PCA. They are both very similar but MDS preserves distances between points wheraeas PCA preserves covariance between points.[pca and mds]: https://www.quora.com/Whats-the-difference-between-MDS-and-PCA
+
+We do the same here as we did with PCA. 'scale.data' slot of the 'SCT' assay contains the data used to run PCA and MDS.
+
+```{r}
+########## MDS ###############
+d <- dist(t(GetAssayData(s, slot = "scale.data")))
+mds <- cmdscale(d = d, k = 2)
+colnames(mds) <- paste0("MDS_", 1:2)
+s[["mds"]] <- CreateDimReducObject(embeddings = mds, key = "MDS_", assay = DefaultAssay(s))
+to.plot <- as.data.frame(Embeddings(s[['mds']])) %>% 
+  mutate(sample=s$sample) 
+p1 <- ggplot(to.plot) + 
+  geom_point(aes(MDS_1, MDS_2, color=sample), size=2)+
+  coord_fixed(1) +
+  geom_vline(xintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  geom_hline(yintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  scale_colour_manual(values=c(cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]), 
+  guide = guide_legend(override.aes = list(size = 5), title='Timepoint'))
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/mds_plot.png'))
+```
+
+```{r}
+## Run MDS on subset ##
+d <- dist(t(GetAssayData(s.s, slot = "scale.data")))
+mds <- cmdscale(d = d, k = 2)
+colnames(mds) <- paste0("MDS_", 1:2)
+s.s[["mds"]] <- CreateDimReducObject(embeddings = mds, key = "MDS_", assay = DefaultAssay(s.s))
+to.plot <- as.data.frame(Embeddings(s.s[['mds']])) %>% 
+  mutate(day=s.s$day) 
+p2 <- ggplot(to.plot) + 
+  geom_point(aes(MDS_1, MDS_2, color=day), size=2)+
+  coord_fixed(1) +
+  geom_vline(xintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  geom_hline(yintercept=0, linetype='dashed', colour='#777777', size=0.2) +
+  scale_colour_manual(values=c(cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]), 
+  guide = guide_legend(override.aes = list(size = 5), title='Timepoint'))
+#ggsave(paste0(root, '/new_visualisations/FINAL_WORKFLOW/mds_plot_batcheffect.png'))
+cowplot::plot_grid(p1+ggtitle('MDS'),p2+ggtitle('MDS to assess day of \n sampling variation'))
+```
+
+```{r}
+### 3D plots ###
+df <- as.data.frame(Embeddings(s, reduction='mds')) %>% mutate(sample=s$sample)
+plot_ly(data = df, x=df$MDS_1, y=df$MDS_2, z=df$MDS_3, type="scatter3d", mode="markers", color=df$sample, size = 2)
+```
+
+
